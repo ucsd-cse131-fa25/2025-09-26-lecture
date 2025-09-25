@@ -1,8 +1,9 @@
 {
-  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "image": "mcr.microsoft.com/devcontainers/universal:linux",
   "features": {
     "ghcr.io/devcontainers/features/rust:1": {}
   },
+  "postCreateCommand": "sudo apt-get update; sudo apt-get install nasm",
   "customizations": {
     "vscode": {
       "extensions": [
