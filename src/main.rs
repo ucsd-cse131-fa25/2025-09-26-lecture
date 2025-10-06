@@ -21,12 +21,16 @@ enum Instr {
   Mov(Reg, i32),     // mov register, immediate
   Add(Reg, i32),     // add register, immediate
   Sub(Reg, i32),     // sub register, immediate
+  AddReg(Reg, Reg),  // add register, register
+  Push(Reg),         // push register to stack
+  Pop(Reg),          // pop from stack to register
 }
 
 enum Expr {
   Num(i32),
   Add1(Box<Expr>),
-  Sub1(Box<Expr>)
+  Sub1(Box<Expr>),
+  Add(Box<Expr>, Box<Expr>),
 }
 
 fn parse_expr(s : &Sexp) -> Expr {
@@ -39,6 +43,8 @@ fn parse_expr(s : &Sexp) -> Expr {
           Expr::Add1(Box::new(parse_expr(e))),
         [Sexp::Atom(S(op)), e] if op == "sub1" =>
           Expr::Sub1(Box::new(parse_expr(e))),
+        [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
+          Expr::Add(Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
   	_ => panic!("parse error")
 	},
     _ => panic!("parse error")
@@ -63,6 +69,9 @@ fn instr_to_string(instr: &Instr) -> String {
     Instr::Mov(reg, val) => format!("mov {}, {}", reg_to_string(reg), val),
     Instr::Add(reg, val) => format!("add {}, {}", reg_to_string(reg), val),
     Instr::Sub(reg, val) => format!("sub {}, {}", reg_to_string(reg), val),
+    Instr::AddReg(reg1, reg2) => format!("add {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
+    Instr::Push(reg) => format!("push {}", reg_to_string(reg)),
+    Instr::Pop(reg) => format!("pop {}", reg_to_string(reg)),
   }
 }
 
@@ -84,6 +93,14 @@ fn compile_expr(e : &Expr) -> Vec<Instr> {
 	Expr::Sub1(subexpr) => {
       let mut instrs = compile_expr(subexpr);
       instrs.push(Instr::Sub(Reg::Rax, 1));
+      instrs
+    },
+	Expr::Add(e1, e2) => {
+      let mut instrs = compile_expr(e1);      // Compile first expr, result in rax
+      instrs.push(Instr::Push(Reg::Rax));     // Save first result on stack
+      instrs.extend(compile_expr(e2));        // Compile second expr, result in rax
+      instrs.push(Instr::Pop(Reg::Rbx));      // Pop first result into rbx
+      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx)); // Add rbx to rax
       instrs
     }
   }
