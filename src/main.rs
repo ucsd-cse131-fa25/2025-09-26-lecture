@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::env;
 use std::io::prelude::*;
+use std::collections::HashMap;
 use sexp::*;
 use sexp::Atom::*;
 
@@ -18,12 +19,12 @@ enum Reg {
 
 #[derive(Debug, Clone)]
 enum Instr {
-  Mov(Reg, i32),     // mov register, immediate
-  Add(Reg, i32),     // add register, immediate
-  Sub(Reg, i32),     // sub register, immediate
-  AddReg(Reg, Reg),  // add register, register
-  Push(Reg),         // push register to stack
-  Pop(Reg),          // pop from stack to register
+  Mov(Reg, i32),         // mov register, immediate
+  Add(Reg, i32),         // add register, immediate
+  Sub(Reg, i32),         // sub register, immediate
+  AddReg(Reg, Reg),      // add register, register
+  MovToStack(Reg, i32),  // mov [rsp - offset], register
+  MovFromStack(Reg, i32), // mov register, [rsp - offset]
 }
 
 enum Expr {
@@ -31,12 +32,16 @@ enum Expr {
   Add1(Box<Expr>),
   Sub1(Box<Expr>),
   Add(Box<Expr>, Box<Expr>),
+  Id(String),
+  Let(String, Box<Expr>, Box<Expr>), // let var = expr1 in expr2
 }
 
 fn parse_expr(s : &Sexp) -> Expr {
   match s {
     Sexp::Atom(I(n)) =>
       Expr::Num(i32::try_from(*n).unwrap()),
+    Sexp::Atom(S(name)) =>
+      Expr::Id(name.to_string()),
     Sexp::List(vec) =>
       match &vec[..] {
         [Sexp::Atom(S(op)), e] if op == "add1" =>
@@ -45,6 +50,12 @@ fn parse_expr(s : &Sexp) -> Expr {
           Expr::Sub1(Box::new(parse_expr(e))),
         [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
           Expr::Add(Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+        [Sexp::Atom(S(op)), Sexp::List(binding), body] if op == "let" =>
+          match &binding[..] {
+            [Sexp::Atom(S(var)), val] =>
+              Expr::Let(var.to_string(), Box::new(parse_expr(val)), Box::new(parse_expr(body))),
+            _ => panic!("parse error in let binding")
+          },
   	_ => panic!("parse error")
 	},
     _ => panic!("parse error")
@@ -70,8 +81,8 @@ fn instr_to_string(instr: &Instr) -> String {
     Instr::Add(reg, val) => format!("add {}, {}", reg_to_string(reg), val),
     Instr::Sub(reg, val) => format!("sub {}, {}", reg_to_string(reg), val),
     Instr::AddReg(reg1, reg2) => format!("add {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
-    Instr::Push(reg) => format!("push {}", reg_to_string(reg)),
-    Instr::Pop(reg) => format!("pop {}", reg_to_string(reg)),
+    Instr::MovToStack(reg, offset) => format!("mov [rsp - {}], {}", offset, reg_to_string(reg)),
+    Instr::MovFromStack(reg, offset) => format!("mov {}, [rsp - {}]", reg_to_string(reg), offset),
   }
 }
 
@@ -83,24 +94,45 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
 }
 
 fn compile_expr(e : &Expr) -> Vec<Instr> {
+  compile_expr_with_env(e, 16, &HashMap::new())
+}
+
+fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>) -> Vec<Instr> {
   match e {
 	Expr::Num(n) => vec![Instr::Mov(Reg::Rax, *n)],
+	Expr::Id(name) => {
+      match env.get(name) {
+        Some(offset) => vec![Instr::MovFromStack(Reg::Rax, *offset)],
+        None => panic!("Unbound variable: {}", name)
+      }
+    },
 	Expr::Add1(subexpr) => {
-      let mut instrs = compile_expr(subexpr);
+      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env);
       instrs.push(Instr::Add(Reg::Rax, 1));
       instrs
     },
 	Expr::Sub1(subexpr) => {
-      let mut instrs = compile_expr(subexpr);
+      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env);
       instrs.push(Instr::Sub(Reg::Rax, 1));
       instrs
     },
 	Expr::Add(e1, e2) => {
-      let mut instrs = compile_expr(e1);      // Compile first expr, result in rax
-      instrs.push(Instr::Push(Reg::Rax));     // Save first result on stack
-      instrs.extend(compile_expr(e2));        // Compile second expr, result in rax
-      instrs.push(Instr::Pop(Reg::Rbx));      // Pop first result into rbx
-      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx)); // Add rbx to rax
+      let mut instrs = compile_expr_with_env(e1, stack_depth, env);  // Compile first expr
+      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));        // Store result at current stack depth
+      instrs.extend(compile_expr_with_env(e2, stack_depth + 8, env)); // Compile second expr with incremented depth
+      instrs.push(Instr::MovFromStack(Reg::Rbx, stack_depth));      // Load first result into rbx
+      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx));              // Add rbx to rax
+      instrs
+    },
+    Expr::Let(var, val_expr, body_expr) => {
+      let mut instrs = compile_expr_with_env(val_expr, stack_depth, env);  // Compile value expression
+      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));              // Store value on stack
+      
+      // Create new environment with this variable mapped to its stack location
+      let mut new_env = env.clone();
+      new_env.insert(var.clone(), stack_depth);
+      
+      instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env)); // Compile body with extended env
       instrs
     }
   }
