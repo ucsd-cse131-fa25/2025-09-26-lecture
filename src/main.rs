@@ -2,19 +2,16 @@ use std::fs::File;
 use std::env;
 use std::io::prelude::*;
 use std::collections::HashMap;
+use std::mem;
 use sexp::*;
 use sexp::Atom::*;
+use dynasmrt::{dynasm, DynasmApi};
 
 #[derive(Debug, Clone)]
 enum Reg {
   Rax,
   Rbx,
-  Rcx,
-  Rdx,
-  Rsi,
-  Rdi,
   Rsp,
-  Rbp,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +24,7 @@ enum Instr {
   MovFromStack(Reg, i32), // mov register, [rsp - offset]
 }
 
+#[derive(Debug)]
 enum Expr {
   Num(i32),
   Add1(Box<Expr>),
@@ -66,12 +64,15 @@ fn reg_to_string(reg: &Reg) -> &str {
   match reg {
     Reg::Rax => "rax",
     Reg::Rbx => "rbx",
-    Reg::Rcx => "rcx",
-    Reg::Rdx => "rdx",
-    Reg::Rsi => "rsi",
-    Reg::Rdi => "rdi",
     Reg::Rsp => "rsp",
-    Reg::Rbp => "rbp",
+  }
+}
+
+fn reg_to_num(reg: &Reg) -> u8 {
+  match reg {
+    Reg::Rax => 0,  // rax
+    Reg::Rbx => 3,  // rbx  
+    Reg::Rsp => 4,  // rsp
   }
 }
 
@@ -138,12 +139,7 @@ fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>)
   }
 }
 
-fn main() -> std::io::Result<()> {
-  let args: Vec<String> = env::args().collect();
-
-  let in_name = &args[1];
-  let out_name = &args[2];
-
+fn compile_mode(in_name: &str, out_name: &str) -> std::io::Result<()> {
   let mut in_file = File::open(in_name)?;
   let mut in_contents = String::new();
   in_file.read_to_string(&mut in_contents)?;
@@ -163,5 +159,106 @@ our_code_starts_here:
   out_file.write_all(asm_program.as_bytes())?;
 
   Ok(())
+}
+
+fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
+  for instr in instrs {
+    match instr {
+      Instr::Mov(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; mov Rq(reg_num), *val);
+      }
+      Instr::Add(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; add Rq(reg_num), *val);
+      }
+      Instr::Sub(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; sub Rq(reg_num), *val);
+      }
+      Instr::AddReg(reg1, reg2) => {
+        let reg1_num = reg_to_num(reg1);
+        let reg2_num = reg_to_num(reg2);
+        dynasm!(ops ; .arch x64 ; add Rq(reg1_num), Rq(reg2_num));
+      }
+      Instr::MovToStack(reg, offset) => {
+        if matches!(reg, Reg::Rsp) {
+          panic!("Cannot move rsp to stack");
+        }
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; mov [rsp - *offset], Rq(reg_num));
+      }
+      Instr::MovFromStack(reg, offset) => {
+        if matches!(reg, Reg::Rsp) {
+          panic!("Cannot move from stack to rsp");
+        }
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; mov Rq(reg_num), [rsp - *offset]);
+      }
+    }
+  }
+}
+
+fn eval_mode(in_name: &str) -> std::io::Result<()> {
+  let mut in_file = File::open(in_name)?;
+  let mut in_contents = String::new();
+  in_file.read_to_string(&mut in_contents)?;
+
+  let expr = parse_expr(&parse(&in_contents).unwrap());
+  
+  // Compile expression to instructions using existing compiler
+  let instrs = compile_expr(&expr);
+  
+  // Create dynasm assembler
+  let mut ops = dynasmrt::x64::Assembler::new().unwrap();
+  let start = ops.offset();
+  
+  // Convert instructions to machine code
+  instrs_to_asm(&instrs, &mut ops);
+  
+  // Add return instruction
+  dynasm!(ops ; .arch x64 ; ret);
+  
+  // Finalize and create function pointer
+  let buf = ops.finalize().unwrap();
+  let jitted_fn: extern "C" fn() -> i64 = unsafe { mem::transmute(buf.ptr(start)) };
+  
+  // Call the JIT-compiled function and print result
+  let result = jitted_fn();
+  println!("{}", result);
+  
+  Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+  let args: Vec<String> = env::args().collect();
+
+  if args.len() < 3 {
+    eprintln!("Usage:");
+    eprintln!("  {} -c <input.snek> <output.s>   # Compile to assembly", args[0]);
+    eprintln!("  {} -e <input.snek>              # Evaluate immediately", args[0]);
+    std::process::exit(1);
+  }
+
+  match args[1].as_str() {
+    "-c" => {
+      if args.len() != 4 {
+        eprintln!("Error: -c flag requires input and output files");
+        std::process::exit(1);
+      }
+      compile_mode(&args[2], &args[3])
+    },
+    "-e" => {
+      if args.len() != 3 {
+        eprintln!("Error: -e flag requires only input file");
+        std::process::exit(1);
+      }
+      eval_mode(&args[2])
+    },
+    _ => {
+      eprintln!("Error: Unknown flag '{}'. Use -c or -e", args[1]);
+      std::process::exit(1);
+    }
+  }
 }
 
