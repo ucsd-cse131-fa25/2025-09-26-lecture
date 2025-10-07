@@ -7,6 +7,18 @@ use sexp::*;
 use sexp::Atom::*;
 use dynasmrt::{dynasm, DynasmApi};
 
+#[derive(Debug)]
+enum ParseError {
+  InvalidSyntax(String),
+  InvalidLetBinding,
+  NumberTooLarge,
+}
+
+#[derive(Debug)]
+enum CompileError {
+  UnboundVariable(String),
+}
+
 #[derive(Debug, Clone)]
 enum Reg {
   Rax,
@@ -34,29 +46,33 @@ enum Expr {
   Let(String, Box<Expr>, Box<Expr>), // let var = expr1 in expr2
 }
 
-fn parse_expr(s : &Sexp) -> Expr {
+fn parse_expr(s : &Sexp) -> Result<Expr, ParseError> {
   match s {
-    Sexp::Atom(I(n)) =>
-      Expr::Num(i32::try_from(*n).unwrap()),
+    Sexp::Atom(I(n)) => {
+      match i32::try_from(*n) {
+        Ok(num) => Ok(Expr::Num(num)),
+        Err(_) => Err(ParseError::NumberTooLarge)
+      }
+    },
     Sexp::Atom(S(name)) =>
-      Expr::Id(name.to_string()),
+      Ok(Expr::Id(name.to_string())),
     Sexp::List(vec) =>
       match &vec[..] {
         [Sexp::Atom(S(op)), e] if op == "add1" =>
-          Expr::Add1(Box::new(parse_expr(e))),
+          Ok(Expr::Add1(Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), e] if op == "sub1" =>
-          Expr::Sub1(Box::new(parse_expr(e))),
+          Ok(Expr::Sub1(Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
-          Expr::Add(Box::new(parse_expr(e1)), Box::new(parse_expr(e2))),
+          Ok(Expr::Add(Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), Sexp::List(binding), body] if op == "let" =>
           match &binding[..] {
             [Sexp::Atom(S(var)), val] =>
-              Expr::Let(var.to_string(), Box::new(parse_expr(val)), Box::new(parse_expr(body))),
-            _ => panic!("parse error in let binding")
+              Ok(Expr::Let(var.to_string(), Box::new(parse_expr(val)?), Box::new(parse_expr(body)?))),
+            _ => Err(ParseError::InvalidLetBinding)
           },
-  	_ => panic!("parse error")
+  	_ => Err(ParseError::InvalidSyntax(format!("Unknown expression: {:?}", vec)))
 	},
-    _ => panic!("parse error")
+    _ => Err(ParseError::InvalidSyntax(format!("Invalid atom: {:?}", s)))
   }
 }
 
@@ -94,47 +110,47 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
     .join("\n")
 }
 
-fn compile_expr(e : &Expr) -> Vec<Instr> {
+fn compile_expr(e : &Expr) -> Result<Vec<Instr>, CompileError> {
   compile_expr_with_env(e, 16, &HashMap::new())
 }
 
-fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>) -> Vec<Instr> {
+fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>) -> Result<Vec<Instr>, CompileError> {
   match e {
-	Expr::Num(n) => vec![Instr::Mov(Reg::Rax, *n)],
+	Expr::Num(n) => Ok(vec![Instr::Mov(Reg::Rax, *n)]),
 	Expr::Id(name) => {
       match env.get(name) {
-        Some(offset) => vec![Instr::MovFromStack(Reg::Rax, *offset)],
-        None => panic!("Unbound variable: {}", name)
+        Some(offset) => Ok(vec![Instr::MovFromStack(Reg::Rax, *offset)]),
+        None => Err(CompileError::UnboundVariable(name.clone()))
       }
     },
 	Expr::Add1(subexpr) => {
-      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env);
+      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env)?;
       instrs.push(Instr::Add(Reg::Rax, 1));
-      instrs
+      Ok(instrs)
     },
 	Expr::Sub1(subexpr) => {
-      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env);
+      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env)?;
       instrs.push(Instr::Sub(Reg::Rax, 1));
-      instrs
+      Ok(instrs)
     },
 	Expr::Add(e1, e2) => {
-      let mut instrs = compile_expr_with_env(e1, stack_depth, env);  // Compile first expr
-      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));        // Store result at current stack depth
-      instrs.extend(compile_expr_with_env(e2, stack_depth + 8, env)); // Compile second expr with incremented depth
-      instrs.push(Instr::MovFromStack(Reg::Rbx, stack_depth));      // Load first result into rbx
-      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx));              // Add rbx to rax
-      instrs
+      let mut instrs = compile_expr_with_env(e1, stack_depth, env)?;  // Compile first expr
+      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));         // Store result at current stack depth
+      instrs.extend(compile_expr_with_env(e2, stack_depth + 8, env)?); // Compile second expr with incremented depth
+      instrs.push(Instr::MovFromStack(Reg::Rbx, stack_depth));       // Load first result into rbx
+      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx));               // Add rbx to rax
+      Ok(instrs)
     },
     Expr::Let(var, val_expr, body_expr) => {
-      let mut instrs = compile_expr_with_env(val_expr, stack_depth, env);  // Compile value expression
-      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));              // Store value on stack
+      let mut instrs = compile_expr_with_env(val_expr, stack_depth, env)?;  // Compile value expression
+      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));               // Store value on stack
       
       // Create new environment with this variable mapped to its stack location
       let mut new_env = env.clone();
       new_env.insert(var.clone(), stack_depth);
       
-      instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env)); // Compile body with extended env
-      instrs
+      instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env)?); // Compile body with extended env
+      Ok(instrs)
     }
   }
 }
@@ -144,8 +160,9 @@ fn compile_mode(in_name: &str, out_name: &str) -> std::io::Result<()> {
   let mut in_contents = String::new();
   in_file.read_to_string(&mut in_contents)?;
 
-  let expr = parse_expr(&parse(&in_contents).unwrap());
-  let instrs = compile_expr(&expr);
+  let s_expr = parse(&in_contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
+  let expr = parse_expr(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Expression parse error: {:?}", e)))?;
+  let instrs = compile_expr(&expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   let result = instrs_to_string(&instrs);
   let asm_program = format!("
 section .text
@@ -199,15 +216,9 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
   }
 }
 
-fn eval_mode(in_name: &str) -> std::io::Result<()> {
-  let mut in_file = File::open(in_name)?;
-  let mut in_contents = String::new();
-  in_file.read_to_string(&mut in_contents)?;
-
-  let expr = parse_expr(&parse(&in_contents).unwrap());
-  
+fn jit_compile_and_run(expr: &Expr) -> Result<i64, CompileError> {
   // Compile expression to instructions using existing compiler
-  let instrs = compile_expr(&expr);
+  let instrs = compile_expr(&expr)?;
   
   // Create dynasm assembler
   let mut ops = dynasmrt::x64::Assembler::new().unwrap();
@@ -223,9 +234,74 @@ fn eval_mode(in_name: &str) -> std::io::Result<()> {
   let buf = ops.finalize().unwrap();
   let jitted_fn: extern "C" fn() -> i64 = unsafe { mem::transmute(buf.ptr(start)) };
   
-  // Call the JIT-compiled function and print result
-  let result = jitted_fn();
+  // Call the JIT-compiled function and return result
+  Ok(jitted_fn())
+}
+
+fn eval_mode(in_name: &str) -> std::io::Result<()> {
+  let mut in_file = File::open(in_name)?;
+  let mut in_contents = String::new();
+  in_file.read_to_string(&mut in_contents)?;
+
+  let s_expr = parse(&in_contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
+  let expr = parse_expr(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Expression parse error: {:?}", e)))?;
+  let result = jit_compile_and_run(&expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   println!("{}", result);
+  
+  Ok(())
+}
+
+fn interactive_mode() -> std::io::Result<()> {
+  println!("Snek REPL - Press Ctrl-D to exit");
+  
+  loop {
+    print!("➤ ");
+    // Flush stdout to ensure prompt is displayed
+    std::io::stdout().flush().unwrap();
+    
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+      Ok(0) => {
+        // EOF (Ctrl-D) - exit gracefully
+        println!("\nGoodbye!");
+        break;
+      }
+      Ok(_) => {
+        let input = input.trim();
+        if input.is_empty() {
+          continue;
+        }
+        
+        // Try to parse and evaluate the expression
+        match parse(input) {
+          Ok(s_expr) => {
+            match parse_expr(&s_expr) {
+              Ok(expr) => {
+                match jit_compile_and_run(&expr) {
+                  Ok(result) => {
+                    println!("{}", result);
+                  }
+                  Err(e) => {
+                    println!("Compile error: {:?}", e);
+                  }
+                }
+              }
+              Err(e) => {
+                println!("Expression parse error: {:?}", e);
+              }
+            }
+          }
+          Err(e) => {
+            println!("S-expression parse error: {:?}", e);
+          }
+        }
+      }
+      Err(e) => {
+        println!("Input error: {}", e);
+        break;
+      }
+    }
+  }
   
   Ok(())
 }
@@ -233,10 +309,11 @@ fn eval_mode(in_name: &str) -> std::io::Result<()> {
 fn main() -> std::io::Result<()> {
   let args: Vec<String> = env::args().collect();
 
-  if args.len() < 3 {
+  if args.len() < 2 {
     eprintln!("Usage:");
     eprintln!("  {} -c <input.snek> <output.s>   # Compile to assembly", args[0]);
     eprintln!("  {} -e <input.snek>              # Evaluate immediately", args[0]);
+    eprintln!("  {} -i                           # Interactive mode", args[0]);
     std::process::exit(1);
   }
 
@@ -255,8 +332,15 @@ fn main() -> std::io::Result<()> {
       }
       eval_mode(&args[2])
     },
+    "-i" => {
+      if args.len() != 2 {
+        eprintln!("Error: -i flag takes no additional arguments");
+        std::process::exit(1);
+      }
+      interactive_mode()
+    },
     _ => {
-      eprintln!("Error: Unknown flag '{}'. Use -c or -e", args[1]);
+      eprintln!("Error: Unknown flag '{}'. Use -c, -e, or -i", args[1]);
       std::process::exit(1);
     }
   }
