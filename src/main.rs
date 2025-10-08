@@ -34,6 +34,12 @@ enum Expr {
   Let(String, Box<Expr>, Box<Expr>), // let var = expr1 in expr2
 }
 
+#[derive(Debug)]
+enum ReplEntry {
+  Define(String, Box<Expr>), // (define var expr)
+  Expr(Box<Expr>),           // just an expression
+}
+
 fn parse_expr(s : &Sexp) -> Expr {
   match s {
     Sexp::Atom(I(n)) =>
@@ -57,6 +63,19 @@ fn parse_expr(s : &Sexp) -> Expr {
   	_ => panic!("parse error")
 	},
     _ => panic!("parse error")
+  }
+}
+
+fn parse_repl_entry(s: &Sexp) -> ReplEntry {
+  match s {
+    Sexp::List(vec) => {
+      match &vec[..] {
+        [Sexp::Atom(S(op)), Sexp::Atom(S(var)), expr] if op == "define" =>
+          ReplEntry::Define(var.to_string(), Box::new(parse_expr(expr))),
+        _ => ReplEntry::Expr(Box::new(parse_expr(s)))
+      }
+    },
+    _ => ReplEntry::Expr(Box::new(parse_expr(s)))
   }
 }
 
@@ -95,45 +114,50 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
 }
 
 fn compile_expr(e : &Expr) -> Vec<Instr> {
-  compile_expr_with_env(e, 16, &HashMap::new())
+  compile_expr_with_env(e, 16, &HashMap::new(), &HashMap::new())
 }
 
-fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>) -> Vec<Instr> {
+fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>, define_env: &HashMap<String, i64>) -> Vec<Instr> {
   match e {
 	Expr::Num(n) => vec![Instr::Mov(Reg::Rax, *n)],
 	Expr::Id(name) => {
       match env.get(name) {
         Some(offset) => vec![Instr::MovFromStack(Reg::Rax, *offset)],
-        None => panic!("Unbound variable: {}", name)
+        None => {
+          match define_env.get(name) {
+            Some(value) => vec![Instr::Mov(Reg::Rax, *value as i32)],
+            None => panic!("Unbound variable: {}", name)
+          }
+        }
       }
     },
 	Expr::Add1(subexpr) => {
-      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env);
+      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env, define_env);
       instrs.push(Instr::Add(Reg::Rax, 1));
       instrs
     },
 	Expr::Sub1(subexpr) => {
-      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env);
+      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env, define_env);
       instrs.push(Instr::Sub(Reg::Rax, 1));
       instrs
     },
 	Expr::Add(e1, e2) => {
-      let mut instrs = compile_expr_with_env(e1, stack_depth, env);  // Compile first expr
+      let mut instrs = compile_expr_with_env(e1, stack_depth, env, define_env);  // Compile first expr
       instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));        // Store result at current stack depth
-      instrs.extend(compile_expr_with_env(e2, stack_depth + 8, env)); // Compile second expr with incremented depth
+      instrs.extend(compile_expr_with_env(e2, stack_depth + 8, env, define_env)); // Compile second expr with incremented depth
       instrs.push(Instr::MovFromStack(Reg::Rbx, stack_depth));      // Load first result into rbx
       instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx));              // Add rbx to rax
       instrs
     },
     Expr::Let(var, val_expr, body_expr) => {
-      let mut instrs = compile_expr_with_env(val_expr, stack_depth, env);  // Compile value expression
+      let mut instrs = compile_expr_with_env(val_expr, stack_depth, env, define_env);  // Compile value expression
       instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));              // Store value on stack
       
       // Create new environment with this variable mapped to its stack location
       let mut new_env = env.clone();
       new_env.insert(var.clone(), stack_depth);
       
-      instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env)); // Compile body with extended env
+      instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env, define_env)); // Compile body with extended env
       instrs
     }
   }
@@ -200,12 +224,20 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
 }
 
 fn eval_snek_source(source: &str) -> Result<i64, String> {
+  eval_snek_source_with_defines(source, &HashMap::new())
+}
+
+fn eval_snek_source_with_defines(source: &str, define_env: &HashMap<String, i64>) -> Result<i64, String> {
   // Parse the source code
   let sexp = parse(source).map_err(|e| format!("Parse error: {}", e))?;
   let expr = parse_expr(&sexp);
   
-  // Compile expression to instructions
-  let instrs = compile_expr(&expr);
+  eval_expr_with_defines(&expr, define_env)
+}
+
+fn eval_expr_with_defines(expr: &Expr, define_env: &HashMap<String, i64>) -> Result<i64, String> {
+  // Compile expression to instructions with define environment
+  let instrs = compile_expr_with_env(expr, 16, &HashMap::new(), define_env);
   
   // Create dynasm assembler
   let mut ops = dynasmrt::x64::Assembler::new().map_err(|_| "Failed to create assembler")?;
@@ -243,6 +275,7 @@ fn interactive_mode() -> std::io::Result<()> {
   
   let stdin = io::stdin();
   let mut reader = stdin.lock();
+  let mut define_env: HashMap<String, i64> = HashMap::new();
   
   loop {
     print!("⟹ ");
@@ -261,11 +294,37 @@ fn interactive_mode() -> std::io::Result<()> {
           continue;
         }
         
-        // Try to parse and evaluate the expression
-        match std::panic::catch_unwind(|| eval_snek_source(input)) {
-          Ok(Ok(result)) => println!("{}", result),
-          Ok(Err(e)) => println!("{}", e),
-          Err(_) => println!("Error: Failed to evaluate expression")
+        // Try to parse as REPL entry (define or expression)
+        match parse(input) {
+          Ok(sexp) => {
+            match std::panic::catch_unwind(|| parse_repl_entry(&sexp)) {
+              Ok(ReplEntry::Define(var, expr)) => {
+                // Evaluate the expression and add to define_env if successful
+                match std::panic::catch_unwind(|| eval_expr_with_defines(&expr, &define_env)) {
+                  Ok(Ok(value)) => {
+                    define_env.insert(var.clone(), value);
+                    println!("Defined {} = {}", var, value);
+                  },
+                  Ok(Err(e)) => println!("{}", e),
+                  Err(_) => println!("Error: Failed to evaluate define expression")
+                }
+              },
+              Ok(ReplEntry::Expr(expr)) => {
+                // For expressions, evaluate with current define environment
+                match std::panic::catch_unwind(|| eval_expr_with_defines(&expr, &define_env)) {
+                  Ok(Ok(result)) => println!("{}", result),
+                  Ok(Err(e)) => println!("{}", e),
+                  Err(_) => println!("Error: Failed to evaluate expression")
+                }
+              }
+              Err(e) => {
+                println!("Compile error: {:?}", e);
+              }
+            }
+          }
+          Err(e) => {
+            println!("Parse error: {}", e);
+          }
         }
       }
       Err(e) => {
