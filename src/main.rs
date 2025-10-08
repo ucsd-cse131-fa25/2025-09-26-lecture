@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::env;
-use std::io::prelude::*;
+use std::io::{self, prelude::*, BufRead};
 use std::collections::HashMap;
 use std::mem;
 use sexp::*;
@@ -199,18 +199,16 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
   }
 }
 
-fn eval_mode(in_name: &str) -> std::io::Result<()> {
-  let mut in_file = File::open(in_name)?;
-  let mut in_contents = String::new();
-  in_file.read_to_string(&mut in_contents)?;
-
-  let expr = parse_expr(&parse(&in_contents).unwrap());
+fn eval_snek_source(source: &str) -> Result<i64, String> {
+  // Parse the source code
+  let sexp = parse(source).map_err(|e| format!("Parse error: {}", e))?;
+  let expr = parse_expr(&sexp);
   
-  // Compile expression to instructions using existing compiler
+  // Compile expression to instructions
   let instrs = compile_expr(&expr);
   
   // Create dynasm assembler
-  let mut ops = dynasmrt::x64::Assembler::new().unwrap();
+  let mut ops = dynasmrt::x64::Assembler::new().map_err(|_| "Failed to create assembler")?;
   let start = ops.offset();
   
   // Convert instructions to machine code
@@ -220,12 +218,62 @@ fn eval_mode(in_name: &str) -> std::io::Result<()> {
   dynasm!(ops ; .arch x64 ; ret);
   
   // Finalize and create function pointer
-  let buf = ops.finalize().unwrap();
+  let buf = ops.finalize().map_err(|_| "Failed to finalize assembly")?;
   let jitted_fn: extern "C" fn() -> i64 = unsafe { mem::transmute(buf.ptr(start)) };
   
-  // Call the JIT-compiled function and print result
-  let result = jitted_fn();
-  println!("{}", result);
+  // Call the JIT-compiled function and return result
+  Ok(jitted_fn())
+}
+
+fn eval_mode(in_name: &str) -> std::io::Result<()> {
+  let mut in_file = File::open(in_name)?;
+  let mut in_contents = String::new();
+  in_file.read_to_string(&mut in_contents)?;
+
+  match eval_snek_source(&in_contents) {
+    Ok(result) => println!("{}", result),
+    Err(e) => eprintln!("Error: {}", e),
+  }
+  
+  Ok(())
+}
+
+fn interactive_mode() -> std::io::Result<()> {
+  println!("Welcome to Snek REPL! Press Ctrl-D to exit.");
+  
+  let stdin = io::stdin();
+  let mut reader = stdin.lock();
+  
+  loop {
+    print!("⟹ ");
+    io::stdout().flush()?; // Make sure prompt is displayed immediately
+    
+    let mut input = String::new();
+    match reader.read_line(&mut input) {
+      Ok(0) => {
+        // EOF (Ctrl-D)
+        println!("\nGoodbye!");
+        break;
+      }
+      Ok(_) => {
+        let input = input.trim();
+        if input.is_empty() {
+          continue;
+        }
+        
+        // Try to parse and evaluate the expression
+        match std::panic::catch_unwind(|| eval_snek_source(input)) {
+          Ok(Ok(result)) => println!("{}", result),
+          Ok(Err(e)) => println!("{}", e),
+          Err(_) => println!("Error: Failed to evaluate expression")
+        }
+      }
+      Err(e) => {
+        eprintln!("Error reading input: {}", e);
+        break;
+      }
+    }
+  }
   
   Ok(())
 }
@@ -233,10 +281,11 @@ fn eval_mode(in_name: &str) -> std::io::Result<()> {
 fn main() -> std::io::Result<()> {
   let args: Vec<String> = env::args().collect();
 
-  if args.len() < 3 {
+  if args.len() < 2 {
     eprintln!("Usage:");
     eprintln!("  {} -c <input.snek> <output.s>   # Compile to assembly", args[0]);
     eprintln!("  {} -e <input.snek>              # Evaluate immediately", args[0]);
+    eprintln!("  {} -i                           # Interactive mode", args[0]);
     std::process::exit(1);
   }
 
@@ -255,8 +304,15 @@ fn main() -> std::io::Result<()> {
       }
       eval_mode(&args[2])
     },
+    "-i" => {
+      if args.len() != 2 {
+        eprintln!("Error: -i flag takes no additional arguments");
+        std::process::exit(1);
+      }
+      interactive_mode()
+    },
     _ => {
-      eprintln!("Error: Unknown flag '{}'. Use -c or -e", args[1]);
+      eprintln!("Error: Unknown flag '{}'. Use -c, -e, or -i", args[1]);
       std::process::exit(1);
     }
   }
