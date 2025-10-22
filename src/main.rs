@@ -7,6 +7,8 @@ use sexp::*;
 use sexp::Atom::*;
 use dynasmrt::{dynasm, DynasmApi};
 
+mod runtime;
+
 #[derive(Debug)]
 enum ParseError {
   InvalidSyntax(String),
@@ -265,9 +267,14 @@ fn jit_compile_and_run_with_defines(expr: &Expr, define_env: &HashMap<String, i6
   
   // Convert instructions to machine code
   instrs_to_asm(&instrs, &mut ops);
+
+  // https://doc.rust-lang.org/std/mem/fn.transmute.html#examples
+  let snek_print_ptr = runtime::snek_print as *const ();
+  let snek_print_addr = unsafe { mem::transmute::<* const (), fn() -> i32>(snek_print_ptr) } as i64;
+  println!("0x{:x}", snek_print_addr);
   
   // Add return instruction
-  dynasm!(ops ; .arch x64 ; ret);
+  dynasm!(ops ; .arch x64 ; sub rsp, 16 ; mov rdi, rax ; mov rax, QWORD snek_print_addr ; call rax ; add rsp, 16 ; ret);
   
   // Finalize and create function pointer
   let buf = ops.finalize().unwrap();
@@ -336,7 +343,7 @@ fn interactive_mode() -> std::io::Result<()> {
                   ReplEntry::Expression(expr) => {
                     match jit_compile_and_run_with_defines(&expr, &define_env) {
                       Ok(result) => {
-                        println!("{}", result);
+                        println!("Result: {}", result);
                       }
                       Err(e) => {
                         println!("Compile error: {:?}", e);
