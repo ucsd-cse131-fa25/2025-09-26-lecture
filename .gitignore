@@ -1,2 +1,7 @@
 test/*.s
 test/*.run 
+target/*
+*.o
+*.a
+*.s
+*.sw*

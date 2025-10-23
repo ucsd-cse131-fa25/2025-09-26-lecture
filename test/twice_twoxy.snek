@@ -1,0 +1,1 @@
+((fun (twice x y) (+ x x)) (fun (twoxy x y) (+ (twice x 0) (twice y 0))) (twoxy 3 4))
