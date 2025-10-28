@@ -2,6 +2,8 @@ use std::fs::File;
 use std::env;
 use std::io::prelude::*;
 use std::collections::HashMap;
+use im::HashMap as ImMap;
+use im::hashmap as immap;
 use std::mem;
 use sexp::*;
 use sexp::Atom::*;
@@ -33,10 +35,28 @@ enum Instr {
   Mov(Reg, i32),         // mov register, immediate
   Add(Reg, i32),         // add register, immediate
   Sub(Reg, i32),         // sub register, immediate
+  Jmp(String),           // Unconditional jump to label
+  JmpReg(Reg),           // Unconditional jump to instrution pointer at address of register
   AddReg(Reg, Reg),      // add register, register
   MovToStack(Reg, i32),  // mov [rsp - offset], register
+  MovLabelToStack(String, i32),  // mov [rsp - offset], label value
   MovFromStack(Reg, i32), // mov register, [rsp - offset]
+  Label(String),         // label definition
 }
+
+#[derive(Debug)]
+enum Defn {
+    Defn2(String, String, String, Expr)
+}
+
+
+
+#[derive(Debug)]
+enum Prog {
+    Prog(Vec<Defn>, Expr)
+}
+
+
 
 #[derive(Debug)]
 enum Expr {
@@ -46,6 +66,7 @@ enum Expr {
   Add(Box<Expr>, Box<Expr>),
   Id(String),
   Let(String, Box<Expr>, Box<Expr>), // let var = expr1 in expr2
+  Call2(String, Box<Expr>, Box<Expr>)
 }
 
 #[derive(Debug)]
@@ -78,10 +99,56 @@ fn parse_expr(s : &Sexp) -> Result<Expr, ParseError> {
               Ok(Expr::Let(var.to_string(), Box::new(parse_expr(val)?), Box::new(parse_expr(body)?))),
             _ => Err(ParseError::InvalidLetBinding)
           },
+        [Sexp::Atom(S(fun_name)), arg1, arg2] =>
+          Ok(Expr::Call2(fun_name.to_string(), Box::new(parse_expr(arg1)?), Box::new(parse_expr(arg2)?))),
   	_ => Err(ParseError::InvalidSyntax(format!("Unknown expression: {:?}", vec)))
 	},
     _ => Err(ParseError::InvalidSyntax(format!("Invalid atom: {:?}", s)))
   }
+}
+
+fn parse_defn(s: &Sexp) -> Result<Defn, ParseError> {
+    match s {
+        Sexp::List(vec) => {
+            if vec.len() != 3 {
+                return Err(ParseError::InvalidSyntax("Definition must have exactly 3 elements.".to_string()));
+            }
+            match (&vec[0], &vec[1], &vec[2]) {
+                (Sexp::Atom(S(fun)), Sexp::List(args), body) if fun == "fun" => {
+                    if args.len() == 3 {
+                        match (&args[0], &args[1], &args[2]) {
+                            (Sexp::Atom(S(name)), Sexp::Atom(S(arg1)), Sexp::Atom(S(arg2))) => {
+                                let expr = parse_expr(body)?;
+                                Ok(Defn::Defn2(name.to_string(), arg1.to_string(), arg2.to_string(), expr))
+                            }
+                            _ => Err(ParseError::InvalidSyntax("Invalid argument structure in definition.".to_string())),
+                        }
+                    } else {
+                        Err(ParseError::InvalidSyntax("Definition arguments must have exactly 3 elements.".to_string()))
+                    }
+                }
+                _ => Err(ParseError::InvalidSyntax("Invalid definition structure.".to_string())),
+            }
+        }
+        _ => Err(ParseError::InvalidSyntax("Definition must be a list.".to_string())),
+    }
+}
+
+fn parse_program(s: &Sexp) -> Result<Prog, ParseError> {
+    match s {
+        Sexp::List(vec) => {
+            if vec.len() < 2 {
+                return Err(ParseError::InvalidSyntax("Program must have at least one expression.".to_string()));
+            }
+            let defns: Result<Vec<Defn>, ParseError> = vec[..vec.len() - 1]
+                .iter()
+                .map(|defn| parse_defn(defn))
+                .collect();
+            let expr = parse_expr(&vec[vec.len() - 1])?;
+            Ok(Prog::Prog(defns?, expr))
+        }
+        _ => Err(ParseError::InvalidSyntax("Program must be a list.".to_string())),
+    }
 }
 
 fn parse_repl_entry(s: &Sexp) -> Result<ReplEntry, ParseError> {
@@ -130,7 +197,11 @@ fn instr_to_string(instr: &Instr) -> String {
     Instr::Sub(reg, val) => format!("sub {}, {}", reg_to_string(reg), val),
     Instr::AddReg(reg1, reg2) => format!("add {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
     Instr::MovToStack(reg, offset) => format!("mov [rsp - {}], {}", offset, reg_to_string(reg)),
+    Instr::MovLabelToStack(label, offset) => format!("lea rax, [rel {}]\nmov QWORD [rsp - {}], rax", label, offset),
     Instr::MovFromStack(reg, offset) => format!("mov {}, [rsp - {}]", reg_to_string(reg), offset),
+    Instr::Label(name) => format!("{name}: "),
+    Instr::Jmp(name) => format!("jmp {name}"),
+    Instr::JmpReg(reg) => format!("jmp [{}]", reg_to_string(reg)),
   }
 }
 
@@ -141,11 +212,22 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
     .join("\n")
 }
 
-fn compile_expr(e : &Expr) -> Result<Vec<Instr>, CompileError> {
-  compile_expr_with_env(e, 16, &HashMap::new(), &HashMap::new())
+fn compile_defn(d : &Defn, define_env : HashMap<String, i64>) -> Result<Vec<Instr>, CompileError> {
+    match d {
+        Defn::Defn2(name, arg1, arg2, body) =>  {
+            let body_env : ImMap<String, i32> = immap!{arg1.clone() => 8, arg2.clone() => 16};
+            let body_instrs = compile_expr_with_env(body, 24, &body_env, &define_env)?;
+            let mut result = vec![ Instr::Label(name.clone()), ];
+            result.extend(body_instrs);
+            result.extend(vec![
+                Instr::JmpReg(Reg::Rsp)
+            ]);
+            Ok(result)
+        }
+    }
 }
 
-fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>, define_env: &HashMap<String, i64>) -> Result<Vec<Instr>, CompileError> {
+fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &ImMap<String, i32>, define_env: &HashMap<String, i64>) -> Result<Vec<Instr>, CompileError> {
   match e {
 	Expr::Num(n) => Ok(vec![Instr::Mov(Reg::Rax, *n)]),
 	Expr::Id(name) => {
@@ -183,12 +265,44 @@ fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &HashMap<String, i32>,
       instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));                           // Store value on stack
       
       // Create new environment with this variable mapped to its stack location
-      let mut new_env = env.clone();
-      new_env.insert(var.clone(), stack_depth);
+      let new_env = env.update(var.clone(), stack_depth);
       
       instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env, define_env)?); // Compile body with extended env
       Ok(instrs)
+    },
+    Expr::Call2(fun, arg1, arg2) => {
+        let mut instrs1 = compile_expr_with_env(arg1, stack_depth + 8, env, define_env)?;
+        let instrs2 = compile_expr_with_env(arg2, stack_depth + 16, env, define_env)?;
+        instrs1.extend(vec![
+            Instr::MovToStack(Reg::Rax, stack_depth + 8),
+            Instr::MovLabelToStack("after_call".to_string(), stack_depth),
+        ]);
+        instrs1.extend(instrs2);
+        instrs1.extend(vec![
+            Instr::MovToStack(Reg::Rax, stack_depth + 16)
+        ]);
+        instrs1.extend(vec![
+            Instr::Sub(Reg::Rsp, stack_depth),
+            Instr::Jmp(fun.to_string()),
+            Instr::Label("after_call".to_string()),
+            Instr::Add(Reg::Rsp, stack_depth)
+        ]);
+        Ok(instrs1)
     }
+  }
+}
+
+fn compile_program(prog: &Prog) -> Result<(Vec<Instr>, Vec<Instr>), CompileError> {
+  match prog {
+      Prog::Prog(defns, expr) => {
+          let mut instrs : Vec<Instr> = Vec::new();
+          for defn in defns {
+              instrs.extend(compile_defn(defn, HashMap::new())?)
+          }
+
+          let expr_instrs = compile_expr_with_env(expr, 16, &ImMap::new(), &HashMap::new())?;
+          Ok((instrs, expr_instrs))
+      }
   }
 }
 
@@ -197,17 +311,18 @@ fn compile_mode(in_name: &str, out_name: &str) -> std::io::Result<()> {
   let mut in_contents = String::new();
   in_file.read_to_string(&mut in_contents)?;
 
-  let s_expr = parse(&in_contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
-  let expr = parse_expr(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Expression parse error: {:?}", e)))?;
-  let instrs = compile_expr(&expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
-  let result = instrs_to_string(&instrs);
+  let prog_wrapped = format!("({})", in_contents);
+  let s_expr = parse(&prog_wrapped).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
+  let prog = parse_program(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Program parse error: {:?}", e)))?;
+  let (defs, main) = compile_program(&prog).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   let asm_program = format!("
 section .text
 global our_code_starts_here
+{}
 our_code_starts_here:
   {}
   ret
-", result);
+", instrs_to_string(&defs), instrs_to_string(&main));
 
   let mut out_file = File::create(out_name)?;
   out_file.write_all(asm_program.as_bytes())?;
@@ -242,6 +357,9 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
         let reg_num = reg_to_num(reg);
         dynasm!(ops ; .arch x64 ; mov [rsp - *offset], Rq(reg_num));
       }
+      Instr::MovLabelToStack(label, offset) => {
+          panic!("Cannot move label to stack dynasm yet");
+      }
       Instr::MovFromStack(reg, offset) => {
         if matches!(reg, Reg::Rsp) {
           panic!("Cannot move from stack to rsp");
@@ -249,6 +367,9 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
         let reg_num = reg_to_num(reg);
         dynasm!(ops ; .arch x64 ; mov Rq(reg_num), [rsp - *offset]);
       }
+      Instr::Label(str) => { panic!("Label not to_asmed yet {}", str) },
+      Instr::Jmp(str) => { panic!("jmp not to_asmed yet {}", str) }
+      Instr::JmpReg(reg) => { panic!("jmpreg not to_asmed yet {:?}", reg) }
     }
   }
 }
@@ -259,7 +380,7 @@ fn jit_compile_and_run(expr: &Expr) -> Result<i64, CompileError> {
 
 fn jit_compile_and_run_with_defines(expr: &Expr, define_env: &HashMap<String, i64>) -> Result<i64, CompileError> {
   // Compile expression to instructions using existing compiler
-  let instrs = compile_expr_with_env(expr, 16, &HashMap::new(), define_env)?;
+  let instrs = compile_expr_with_env(expr, 16, &ImMap::new(), define_env)?;
   
   // Create dynasm assembler
   let mut ops = dynasmrt::x64::Assembler::new().unwrap();
@@ -411,4 +532,3 @@ fn main() -> std::io::Result<()> {
     }
   }
 }
-
