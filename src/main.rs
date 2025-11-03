@@ -2,6 +2,7 @@ use std::fs::File;
 use std::env;
 use std::io::prelude::*;
 use std::collections::HashMap;
+use std::cell::RefCell;
 use dynasmrt::DynamicLabel;
 use dynasmrt::DynasmLabelApi;
 use im::HashMap as ImMap;
@@ -41,6 +42,7 @@ struct Context<'a> {
     define_env: &'a DefineEnv,
     env: &'a Env,
     stack_depth: i32,
+    label_counter: &'a RefCell<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +221,13 @@ fn instr_to_string(instr: &Instr) -> String {
   }
 }
 
+fn generate_unique_label(prefix: &str, counter: &RefCell<u32>) -> String {
+    let mut count = counter.borrow_mut();
+    let label = format!("{}_{}", prefix, *count);
+    *count += 1;
+    label
+}
+
 fn instrs_to_string(instrs: &Vec<Instr>) -> String {
   instrs.iter()
     .map(instr_to_string)
@@ -234,6 +243,7 @@ fn compile_defn(d: &Defn, context: &Context) -> Result<Vec<Instr>, CompileError>
                 define_env: context.define_env,
                 env: &body_env,
                 stack_depth: 24,
+                label_counter: context.label_counter,
             };
             let body_instrs = compile_expr_with_env(body, &new_context)?;
             let mut result = vec![ Instr::Label(name.clone()), ];
@@ -293,6 +303,7 @@ fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, Comp
           define_env: context.define_env,
           env: &new_env,
           stack_depth: context.stack_depth + 8,
+          label_counter: context.label_counter,
       };
       
       instrs.extend(compile_expr_with_env(body_expr, &new_context)?); // Compile body with extended env
@@ -306,16 +317,20 @@ fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, Comp
         let mut instrs1 = compile_expr_with_env(arg1, &new_context1)?;
         let new_context2 = Context { stack_depth: fixed_depth + 16, ..new_context1};
         let instrs2 = compile_expr_with_env(arg2, &new_context2)?;
+        
+        // Generate unique label for this call
+        let after_call_label = generate_unique_label("after_call", context.label_counter);
+        
         instrs1.extend(vec![
             Instr::MovToStack(Reg::Rax, fixed_depth + 8),
         ]);
         instrs1.extend(instrs2);
         instrs1.extend(vec![
             Instr::MovToStack(Reg::Rax, fixed_depth + 16),
-            Instr::MovLabelToStack("after_call".to_string(), fixed_depth),
+            Instr::MovLabelToStack(after_call_label.clone(), fixed_depth),
             Instr::Sub(Reg::Rsp, fixed_depth),
             Instr::Jmp(fun.to_string()),
-            Instr::Label("after_call".to_string()),
+            Instr::Label(after_call_label),
             Instr::Add(Reg::Rsp, fixed_depth)
         ]);
         Ok(instrs1)
@@ -327,10 +342,12 @@ fn compile_program(prog: &Prog) -> Result<(Vec<Instr>, Vec<Instr>), CompileError
   match prog {
       Prog::Prog(defns, expr) => {
           let mut instrs: Vec<Instr> = Vec::new();
+          let label_counter = RefCell::new(0);
           let context = Context {
               define_env: &HashMap::new(),
               env: &ImMap::new(),
               stack_depth: 16,
+              label_counter: &label_counter,
           };
 
           for defn in defns {
@@ -436,25 +453,29 @@ fn jit_compile_and_run_program(program: &Prog, ops : &mut dynasmrt::x64::Assembl
     let mut labels = HashMap::new();
     match program {
         Prog::Prog(defs, main) => {
+            let label_counter = RefCell::new(0);
             let context = Context {
                 define_env: &HashMap::new(),
                 env: &ImMap::new(),
                 stack_depth: 16,
+                label_counter: &label_counter,
             };
             for defn in defs {
                 jit_load_function(defn, &context, ops, &mut labels)?;
             }
-            return jit_compile_and_run(main, ops, &mut labels);
+            return jit_compile_and_run_with_defines(main, &context, ops, &mut labels);
         }
     }
     
 }
 
 fn jit_compile_and_run(expr: &Expr, ops : &mut dynasmrt::x64::Assembler, labels : &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
+  let label_counter = RefCell::new(0);
   let context = Context {
       define_env: &HashMap::new(),
       env: &ImMap::new(),
       stack_depth: 16,
+      label_counter: &label_counter,
   };
   jit_compile_and_run_with_defines(expr, &context, ops, labels)
 }
@@ -521,6 +542,9 @@ fn interactive_mode() -> std::io::Result<()> {
   // Track defined variables and their values
   let mut define_env: HashMap<String, i64> = HashMap::new();
   
+  // Label counter that persists across REPL entries
+  let label_counter = RefCell::new(0);
+  
   let mut ops = dynasmrt::x64::Assembler::new()?;
   let mut labels = HashMap::new();
   
@@ -552,6 +576,7 @@ fn interactive_mode() -> std::io::Result<()> {
                           define_env: &define_env,
                           env: &ImMap::new(),
                           stack_depth: 16,
+                          label_counter: &label_counter,
                       };
                       match jit_load_function(&d, &context, &mut ops, &mut labels) {
                           Ok(_) => {
@@ -568,6 +593,7 @@ fn interactive_mode() -> std::io::Result<()> {
                         define_env: &define_env,
                         env: &ImMap::new(),
                         stack_depth: 16,
+                        label_counter: &label_counter,
                     };
                     match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
                       Ok(value) => {
@@ -583,6 +609,7 @@ fn interactive_mode() -> std::io::Result<()> {
                         define_env: &define_env,
                         env: &ImMap::new(),
                         stack_depth: 16,
+                        label_counter: &label_counter,
                     };
                     match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
                       Ok(result) => {
