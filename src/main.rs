@@ -600,14 +600,15 @@ fn interactive_mode() -> std::io::Result<()> {
           Ok(s_expr) => {
             match parse_repl_entry(&s_expr) {
               Ok(repl_entry) => {
+                let context = Context {
+                    define_env: &define_env,
+                    env: &ImMap::new(),
+                    stack_depth: 16,
+                    label_counter: &label_counter,
+                };
+                
                 match repl_entry {
                   ReplEntry::Fun(d) => {
-                      let context = Context {
-                          define_env: &define_env,
-                          env: &ImMap::new(),
-                          stack_depth: 16,
-                          label_counter: &label_counter,
-                      };
                       match jit_load_function(&d, &context, &mut ops, &mut labels) {
                           Ok(_) => {
                               println!("Function loaded successfully");
@@ -619,12 +620,6 @@ fn interactive_mode() -> std::io::Result<()> {
                   }
                   ReplEntry::Define(var_name, expr) => {
                     // Evaluate the expression and store its value
-                    let context = Context {
-                        define_env: &define_env,
-                        env: &ImMap::new(),
-                        stack_depth: 16,
-                        label_counter: &label_counter,
-                    };
                     match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
                       Ok(value) => {
                         define_env.insert(var_name.clone(), value);
@@ -635,12 +630,6 @@ fn interactive_mode() -> std::io::Result<()> {
                     }
                   }
                   ReplEntry::Expression(expr) => {
-                    let context = Context {
-                        define_env: &define_env,
-                        env: &ImMap::new(),
-                        stack_depth: 16,
-                        label_counter: &label_counter,
-                    };
                     match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
                       Ok(result) => {
                         println!("Result: {}", result);
