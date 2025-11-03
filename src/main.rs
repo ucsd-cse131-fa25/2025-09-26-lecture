@@ -2,7 +2,10 @@ use std::fs::File;
 use std::env;
 use std::io::prelude::*;
 use std::collections::HashMap;
+use dynasmrt::DynamicLabel;
+use dynasmrt::DynasmLabelApi;
 use im::HashMap as ImMap;
+
 use im::hashmap as immap;
 use std::mem;
 use sexp::*;
@@ -25,9 +28,19 @@ enum CompileError {
 
 #[derive(Debug, Clone)]
 enum Reg {
-  Rax,
-  Rbx,
-  Rsp,
+    Rax,
+    Rcx,
+    Rsp,
+}
+
+type Env = ImMap<String, i32>;
+type DefineEnv = HashMap<String, i64>;
+
+#[derive(Debug, Clone)]
+struct Context<'a> {
+    define_env: &'a DefineEnv,
+    env: &'a Env,
+    stack_depth: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -49,14 +62,10 @@ enum Defn {
     Defn2(String, String, String, Expr)
 }
 
-
-
 #[derive(Debug)]
 enum Prog {
     Prog(Vec<Defn>, Expr)
 }
-
-
 
 #[derive(Debug)]
 enum Expr {
@@ -72,6 +81,7 @@ enum Expr {
 #[derive(Debug)]
 enum ReplEntry {
   Define(String, Expr),
+  Fun(Defn),
   Expression(Expr),
 }
 
@@ -137,7 +147,7 @@ fn parse_defn(s: &Sexp) -> Result<Defn, ParseError> {
 fn parse_program(s: &Sexp) -> Result<Prog, ParseError> {
     match s {
         Sexp::List(vec) => {
-            if vec.len() < 2 {
+            if vec.len() < 1 {
                 return Err(ParseError::InvalidSyntax("Program must have at least one expression.".to_string()));
             }
             let defns: Result<Vec<Defn>, ParseError> = vec[..vec.len() - 1]
@@ -159,6 +169,10 @@ fn parse_repl_entry(s: &Sexp) -> Result<ReplEntry, ParseError> {
           let expr = parse_expr(val)?;
           Ok(ReplEntry::Define(var.to_string(), expr))
         }
+        [Sexp::Atom(S(op)), ..] if op == "fun" => {
+          let d = parse_defn(s)?;
+          Ok(ReplEntry::Fun(d))
+        }
         _ => {
           // If it's not a define, try to parse as an expression
           let expr = parse_expr(s)?;
@@ -177,16 +191,16 @@ fn parse_repl_entry(s: &Sexp) -> Result<ReplEntry, ParseError> {
 fn reg_to_string(reg: &Reg) -> &str {
   match reg {
     Reg::Rax => "rax",
-    Reg::Rbx => "rbx",
+    Reg::Rcx => "rcx",
     Reg::Rsp => "rsp",
   }
 }
 
 fn reg_to_num(reg: &Reg) -> u8 {
   match reg {
-    Reg::Rax => 0,  // rax
-    Reg::Rbx => 3,  // rbx  
-    Reg::Rsp => 4,  // rsp
+    Reg::Rax => 0,
+    Reg::Rcx => 3,
+    Reg::Rsp => 4,
   }
 }
 
@@ -212,11 +226,16 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
     .join("\n")
 }
 
-fn compile_defn(d : &Defn, define_env : HashMap<String, i64>) -> Result<Vec<Instr>, CompileError> {
+fn compile_defn(d: &Defn, context: &Context) -> Result<Vec<Instr>, CompileError> {
     match d {
         Defn::Defn2(name, arg1, arg2, body) =>  {
             let body_env : ImMap<String, i32> = immap!{arg1.clone() => 8, arg2.clone() => 16};
-            let body_instrs = compile_expr_with_env(body, 24, &body_env, &define_env)?;
+            let new_context = Context {
+                define_env: context.define_env,
+                env: &body_env,
+                stack_depth: 24,
+            };
+            let body_instrs = compile_expr_with_env(body, &new_context)?;
             let mut result = vec![ Instr::Label(name.clone()), ];
             result.extend(body_instrs);
             result.extend(vec![
@@ -227,65 +246,77 @@ fn compile_defn(d : &Defn, define_env : HashMap<String, i64>) -> Result<Vec<Inst
     }
 }
 
-fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &ImMap<String, i32>, define_env: &HashMap<String, i64>) -> Result<Vec<Instr>, CompileError> {
+fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, CompileError> {
   match e {
 	Expr::Num(n) => Ok(vec![Instr::Mov(Reg::Rax, *n)]),
 	Expr::Id(name) => {
-      match env.get(name) {
+      match context.env.get(name) {
         Some(offset) => Ok(vec![Instr::MovFromStack(Reg::Rax, *offset)]),
         None => {
           // Check define_env for defined variables
-          match define_env.get(name) {
+          match context.define_env.get(name) {
             Some(value) => Ok(vec![Instr::Mov(Reg::Rax, *value as i32)]),
-            None => Err(CompileError::UnboundVariable(name.clone()))
+            None => {
+              eprintln!("Context: {:?}", context);
+              Err(CompileError::UnboundVariable(name.clone()))   
+            }
           }
         }
       }
     },
 	Expr::Add1(subexpr) => {
-      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env, define_env)?;
+      let mut instrs = compile_expr_with_env(subexpr, context)?;
       instrs.push(Instr::Add(Reg::Rax, 1));
       Ok(instrs)
     },
 	Expr::Sub1(subexpr) => {
-      let mut instrs = compile_expr_with_env(subexpr, stack_depth, env, define_env)?;
+      let mut instrs = compile_expr_with_env(subexpr, context)?;
       instrs.push(Instr::Sub(Reg::Rax, 1));
       Ok(instrs)
     },
 	Expr::Add(e1, e2) => {
-      let mut instrs = compile_expr_with_env(e1, stack_depth, env, define_env)?;  // Compile first expr
-      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));                     // Store result at current stack depth
-      instrs.extend(compile_expr_with_env(e2, stack_depth + 8, env, define_env)?); // Compile second expr with incremented depth
-      instrs.push(Instr::MovFromStack(Reg::Rbx, stack_depth));                   // Load first result into rbx
-      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rbx));                           // Add rbx to rax
+      let mut instrs = compile_expr_with_env(e1, context)?;  // Compile first expr
+      instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));                     // Store result at current stack depth
+      let new_context = Context { stack_depth: context.stack_depth + 8, ..*context };
+      instrs.extend(compile_expr_with_env(e2, &new_context)?); // Compile second expr with incremented depth
+      instrs.push(Instr::MovFromStack(Reg::Rcx, context.stack_depth));                   // Load first result into rcx
+      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rcx));                           // Add rcx to rax
       Ok(instrs)
     },
     Expr::Let(var, val_expr, body_expr) => {
-      let mut instrs = compile_expr_with_env(val_expr, stack_depth, env, define_env)?;  // Compile value expression
-      instrs.push(Instr::MovToStack(Reg::Rax, stack_depth));                           // Store value on stack
+      let mut instrs = compile_expr_with_env(val_expr, context)?;  // Compile value expression
+      instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));                           // Store value on stack
       
       // Create new environment with this variable mapped to its stack location
-      let new_env = env.update(var.clone(), stack_depth);
+      let new_env = context.env.update(var.clone(), context.stack_depth);
+      let new_context = Context {
+          define_env: context.define_env,
+          env: &new_env,
+          stack_depth: context.stack_depth + 8,
+      };
       
-      instrs.extend(compile_expr_with_env(body_expr, stack_depth + 8, &new_env, define_env)?); // Compile body with extended env
+      instrs.extend(compile_expr_with_env(body_expr, &new_context)?); // Compile body with extended env
       Ok(instrs)
     },
     Expr::Call2(fun, arg1, arg2) => {
-        let mut instrs1 = compile_expr_with_env(arg1, stack_depth + 8, env, define_env)?;
-        let instrs2 = compile_expr_with_env(arg2, stack_depth + 16, env, define_env)?;
+        let stack_depth = context.stack_depth;
+        let extra_depth = if stack_depth % 16 == 0 { 0 } else { 16 - stack_depth % 16 };
+        let fixed_depth = extra_depth + stack_depth;
+        let new_context1 = Context {  stack_depth: fixed_depth + 8, ..*context };
+        let mut instrs1 = compile_expr_with_env(arg1, &new_context1)?;
+        let new_context2 = Context { stack_depth: fixed_depth + 16, ..new_context1};
+        let instrs2 = compile_expr_with_env(arg2, &new_context2)?;
         instrs1.extend(vec![
-            Instr::MovToStack(Reg::Rax, stack_depth + 8),
-            Instr::MovLabelToStack("after_call".to_string(), stack_depth),
+            Instr::MovToStack(Reg::Rax, fixed_depth + 8),
         ]);
         instrs1.extend(instrs2);
         instrs1.extend(vec![
-            Instr::MovToStack(Reg::Rax, stack_depth + 16)
-        ]);
-        instrs1.extend(vec![
-            Instr::Sub(Reg::Rsp, stack_depth),
+            Instr::MovToStack(Reg::Rax, fixed_depth + 16),
+            Instr::MovLabelToStack("after_call".to_string(), fixed_depth),
+            Instr::Sub(Reg::Rsp, fixed_depth),
             Instr::Jmp(fun.to_string()),
             Instr::Label("after_call".to_string()),
-            Instr::Add(Reg::Rsp, stack_depth)
+            Instr::Add(Reg::Rsp, fixed_depth)
         ]);
         Ok(instrs1)
     }
@@ -295,12 +326,18 @@ fn compile_expr_with_env(e: &Expr, stack_depth: i32, env: &ImMap<String, i32>, d
 fn compile_program(prog: &Prog) -> Result<(Vec<Instr>, Vec<Instr>), CompileError> {
   match prog {
       Prog::Prog(defns, expr) => {
-          let mut instrs : Vec<Instr> = Vec::new();
+          let mut instrs: Vec<Instr> = Vec::new();
+          let context = Context {
+              define_env: &HashMap::new(),
+              env: &ImMap::new(),
+              stack_depth: 16,
+          };
+
           for defn in defns {
-              instrs.extend(compile_defn(defn, HashMap::new())?)
+              instrs.extend(compile_defn(defn, &context)?)
           }
 
-          let expr_instrs = compile_expr_with_env(expr, 16, &ImMap::new(), &HashMap::new())?;
+          let expr_instrs = compile_expr_with_env(expr, &context)?;
           Ok((instrs, expr_instrs))
       }
   }
@@ -330,7 +367,18 @@ our_code_starts_here:
   Ok(())
 }
 
-fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
+fn get_or_create_label(ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>, str: &str) -> DynamicLabel {
+    match labels.get(str) {
+        Some(label) => *label,
+        None => {
+            let label = ops.new_dynamic_label();
+            labels.insert(str.to_string(), label);
+            label
+        }
+    }
+}   
+
+fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) {
   for instr in instrs {
     match instr {
       Instr::Mov(reg, val) => {
@@ -358,7 +406,8 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
         dynasm!(ops ; .arch x64 ; mov [rsp - *offset], Rq(reg_num));
       }
       Instr::MovLabelToStack(label, offset) => {
-          panic!("Cannot move label to stack dynasm yet");
+          let resolved = get_or_create_label(ops, labels, label);
+          dynasm!(ops ; .arch x64 ; lea rax, [=>resolved] ; mov [rsp - *offset], rax);
       }
       Instr::MovFromStack(reg, offset) => {
         if matches!(reg, Reg::Rsp) {
@@ -367,42 +416,89 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler) {
         let reg_num = reg_to_num(reg);
         dynasm!(ops ; .arch x64 ; mov Rq(reg_num), [rsp - *offset]);
       }
-      Instr::Label(str) => { panic!("Label not to_asmed yet {}", str) },
-      Instr::Jmp(str) => { panic!("jmp not to_asmed yet {}", str) }
-      Instr::JmpReg(reg) => { panic!("jmpreg not to_asmed yet {:?}", reg) }
+      Instr::Label(str) => {
+          let label = get_or_create_label(ops, labels, str);
+          dynasm!(ops ; .arch x64 ; =>label);
+      }
+      Instr::Jmp(str) => {
+          let label = get_or_create_label(ops, labels, str);
+          dynasm!(ops ; .arch x64 ; jmp =>label)
+      }
+      Instr::JmpReg(reg) => {
+          let reg_num = reg_to_num(reg);
+          dynasm!(ops ; .arch x64 ; mov rcx, [Rq(reg_num)]; jmp rcx);
+      }
     }
   }
 }
 
-fn jit_compile_and_run(expr: &Expr) -> Result<i64, CompileError> {
-  jit_compile_and_run_with_defines(expr, &HashMap::new())
+fn jit_compile_and_run_program(program: &Prog, ops : &mut dynasmrt::x64::Assembler) -> Result<i64, CompileError> {
+    let mut labels = HashMap::new();
+    match program {
+        Prog::Prog(defs, main) => {
+            let context = Context {
+                define_env: &HashMap::new(),
+                env: &ImMap::new(),
+                stack_depth: 16,
+            };
+            for defn in defs {
+                jit_load_function(defn, &context, ops, &mut labels)?;
+            }
+            return jit_compile_and_run(main, ops, &mut labels);
+        }
+    }
+    
 }
 
-fn jit_compile_and_run_with_defines(expr: &Expr, define_env: &HashMap<String, i64>) -> Result<i64, CompileError> {
-  // Compile expression to instructions using existing compiler
-  let instrs = compile_expr_with_env(expr, 16, &ImMap::new(), define_env)?;
-  
-  // Create dynasm assembler
-  let mut ops = dynasmrt::x64::Assembler::new().unwrap();
-  let start = ops.offset();
-  
-  // Convert instructions to machine code
-  instrs_to_asm(&instrs, &mut ops);
+fn jit_compile_and_run(expr: &Expr, ops : &mut dynasmrt::x64::Assembler, labels : &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
+  let context = Context {
+      define_env: &HashMap::new(),
+      env: &ImMap::new(),
+      stack_depth: 16,
+  };
+  jit_compile_and_run_with_defines(expr, &context, ops, labels)
+}
 
-  // https://doc.rust-lang.org/std/mem/fn.transmute.html#examples
-  let snek_print_ptr = runtime::snek_print as *const ();
-  let snek_print_addr = unsafe { mem::transmute::<* const (), fn() -> i32>(snek_print_ptr) } as i64;
-  println!("0x{:x}", snek_print_addr);
+
+fn jit_load_function(defn: &Defn, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<dynasmrt::AssemblyOffset, CompileError> {
+    let instrs = compile_defn(defn, context)?;
+    println!("Compiled function\n{}", instrs_to_string(&instrs));
+    let start = ops.offset();
+    instrs_to_asm(&instrs, ops, labels);
+    ops.commit().unwrap();
+    Ok(start)
+}
+
+fn jit_run_instrs(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
+    let start = ops.offset();
+    let run_label = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; =>run_label);
+    instrs_to_asm(&instrs, ops, labels);
+    dynasm!(ops ; .arch x64 ; ret);
   
-  // Add return instruction
-  dynasm!(ops ; .arch x64 ; sub rsp, 16 ; mov rdi, rax ; mov rax, QWORD snek_print_addr ; call rax ; add rsp, 16 ; ret);
-  
-  // Finalize and create function pointer
-  let buf = ops.finalize().unwrap();
-  let jitted_fn: extern "C" fn() -> i64 = unsafe { mem::transmute(buf.ptr(start)) };
-  
-  // Call the JIT-compiled function and return result
-  Ok(jitted_fn())
+    match ops.commit() {
+        Ok(_) => (),
+        Err(e) => {
+            println!("{:?}", labels);
+            println!("{:?}", ops.labels());
+            panic!("{}", e)
+        }
+    }
+    let reader = ops.reader();
+    {
+      let raw_ptr = reader.lock().ptr(ops.labels().resolve_dynamic(run_label).unwrap());
+      let jitted_fn: extern "C" fn() -> i64 = unsafe { mem::transmute(raw_ptr) };
+      Ok(jitted_fn())
+    }
+    
+}
+
+fn jit_compile_and_run_with_defines(expr: &Expr, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
+  // Compile expression to instructions using existing compiler
+  let instrs = compile_expr_with_env(expr, context)?;
+  println!("Compiled\n{}", instrs_to_string(&instrs));
+  jit_run_instrs(&instrs, ops, labels)
+
 }
 
 fn eval_mode(in_name: &str) -> std::io::Result<()> {
@@ -410,9 +506,11 @@ fn eval_mode(in_name: &str) -> std::io::Result<()> {
   let mut in_contents = String::new();
   in_file.read_to_string(&mut in_contents)?;
 
-  let s_expr = parse(&in_contents).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
-  let expr = parse_expr(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Expression parse error: {:?}", e)))?;
-  let result = jit_compile_and_run(&expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
+  let mut ops = dynasmrt::x64::Assembler::new()?;
+  let prog_wrapped = format!("({})", in_contents);
+  let s_expr = parse(&prog_wrapped).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
+  let prog = parse_program(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Expression parse error: {:?}", e)))?;
+  let result = jit_compile_and_run_program(&prog, &mut ops).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   println!("{}", result);
   
   Ok(())
@@ -423,6 +521,9 @@ fn interactive_mode() -> std::io::Result<()> {
   
   // Track defined variables and their values
   let mut define_env: HashMap<String, i64> = HashMap::new();
+  
+  let mut ops = dynasmrt::x64::Assembler::new()?;
+  let mut labels = HashMap::new();
   
   loop {
     print!("➤ ");
@@ -442,27 +543,49 @@ fn interactive_mode() -> std::io::Result<()> {
           continue;
         }
         
-        // Try to parse and handle the REPL entry
         match parse(input) {
           Ok(s_expr) => {
             match parse_repl_entry(&s_expr) {
               Ok(repl_entry) => {
                 match repl_entry {
+                  ReplEntry::Fun(d) => {
+                      let context = Context {
+                          define_env: &define_env,
+                          env: &ImMap::new(),
+                          stack_depth: 16,
+                      };
+                      match jit_load_function(&d, &context, &mut ops, &mut labels) {
+                          Ok(_) => {
+                              println!("Function loaded successfully");
+                          }
+                          Err(e) => {
+                              println!("Error loading function: {:?}", e);
+                          }
+                      }
+                  }
                   ReplEntry::Define(var_name, expr) => {
                     // Evaluate the expression and store its value
-                    match jit_compile_and_run_with_defines(&expr, &define_env) {
+                    let context = Context {
+                        define_env: &define_env,
+                        env: &ImMap::new(),
+                        stack_depth: 16,
+                    };
+                    match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
                       Ok(value) => {
                         define_env.insert(var_name.clone(), value);
-                        // Don't print anything for successful defines
                       }
                       Err(e) => {
                         println!("Define error: {:?}", e);
-                        // Don't add binding if there's an error
                       }
                     }
                   }
                   ReplEntry::Expression(expr) => {
-                    match jit_compile_and_run_with_defines(&expr, &define_env) {
+                    let context = Context {
+                        define_env: &define_env,
+                        env: &ImMap::new(),
+                        stack_depth: 16,
+                    };
+                    match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
                       Ok(result) => {
                         println!("Result: {}", result);
                       }
