@@ -470,7 +470,6 @@ fn jit_load_function(defn: &Defn, context: &Context, ops: &mut dynasmrt::x64::As
 }
 
 fn jit_run_instrs(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
-    let start = ops.offset();
     let run_label = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>run_label);
     instrs_to_asm(&instrs, ops, labels);
