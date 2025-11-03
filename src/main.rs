@@ -70,14 +70,29 @@ enum Prog {
 }
 
 #[derive(Debug)]
+enum BinOp {
+  Less,
+  Greater,
+  Equal,
+  Mult,
+  Minus
+}
+
+#[derive(Debug)]
 enum Expr {
   Num(i32),
+  True,
+  False,
   Add1(Box<Expr>),
   Sub1(Box<Expr>),
   Add(Box<Expr>, Box<Expr>),
+  Binop(BinOp, Box<Expr>, Box<Expr>),
   Id(String),
   Let(String, Box<Expr>, Box<Expr>), // let var = expr1 in expr2
-  Call2(String, Box<Expr>, Box<Expr>)
+  Call2(String, Box<Expr>, Box<Expr>),
+  If(Box<Expr>, Box<Expr>, Box<Expr>),
+  Loop(Box<Expr>),
+  Break(Box<Expr>)
 }
 
 #[derive(Debug)]
@@ -95,8 +110,13 @@ fn parse_expr(s : &Sexp) -> Result<Expr, ParseError> {
         Err(_) => Err(ParseError::NumberTooLarge)
       }
     },
-    Sexp::Atom(S(name)) =>
-      Ok(Expr::Id(name.to_string())),
+    Sexp::Atom(S(name)) => {
+      match name.as_str() {
+        "true" => Ok(Expr::True),
+        "false" => Ok(Expr::False),
+        _ => Ok(Expr::Id(name.to_string()))
+      }
+    },
     Sexp::List(vec) =>
       match &vec[..] {
         [Sexp::Atom(S(op)), e] if op == "add1" =>
@@ -105,6 +125,22 @@ fn parse_expr(s : &Sexp) -> Result<Expr, ParseError> {
           Ok(Expr::Sub1(Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
           Ok(Expr::Add(Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+        [Sexp::Atom(S(op)), e1, e2] if op == "<" =>
+          Ok(Expr::Binop(BinOp::Less, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+        [Sexp::Atom(S(op)), e1, e2] if op == ">" =>
+          Ok(Expr::Binop(BinOp::Greater, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+        [Sexp::Atom(S(op)), e1, e2] if op == "=" =>
+          Ok(Expr::Binop(BinOp::Equal, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+        [Sexp::Atom(S(op)), e1, e2] if op == "*" =>
+          Ok(Expr::Binop(BinOp::Mult, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+        [Sexp::Atom(S(op)), e1, e2] if op == "-" =>
+          Ok(Expr::Binop(BinOp::Minus, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+        [Sexp::Atom(S(op)), condition, then_expr, else_expr] if op == "if" =>
+          Ok(Expr::If(Box::new(parse_expr(condition)?), Box::new(parse_expr(then_expr)?), Box::new(parse_expr(else_expr)?))),
+        [Sexp::Atom(S(op)), e] if op == "loop" =>
+          Ok(Expr::Loop(Box::new(parse_expr(e)?))),
+        [Sexp::Atom(S(op)), e] if op == "break" =>
+          Ok(Expr::Break(Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), Sexp::List(binding), body] if op == "let" =>
           match &binding[..] {
             [Sexp::Atom(S(var)), val] =>
@@ -259,6 +295,12 @@ fn compile_defn(d: &Defn, context: &Context) -> Result<Vec<Instr>, CompileError>
 fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, CompileError> {
   match e {
 	Expr::Num(n) => Ok(vec![Instr::Mov(Reg::Rax, *n)]),
+	Expr::True => panic!("Code generation for boolean true not implemented yet"),
+	Expr::False => panic!("Code generation for boolean false not implemented yet"),
+	Expr::Binop(op, e1, e2) => panic!("Code generation for binary operators not implemented yet"),
+	Expr::If(condition, then_expr, else_expr) => panic!("Code generation for if expressions not implemented yet"),
+	Expr::Loop(body) => panic!("Code generation for loop expressions not implemented yet"),
+	Expr::Break(value) => panic!("Code generation for break expressions not implemented yet"),
 	Expr::Id(name) => {
       match context.env.get(name) {
         Some(offset) => Ok(vec![Instr::MovFromStack(Reg::Rax, *offset)]),
@@ -468,18 +510,6 @@ fn jit_compile_and_run_program(program: &Prog, ops : &mut dynasmrt::x64::Assembl
     }
     
 }
-
-fn jit_compile_and_run(expr: &Expr, ops : &mut dynasmrt::x64::Assembler, labels : &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
-  let label_counter = RefCell::new(0);
-  let context = Context {
-      define_env: &HashMap::new(),
-      env: &ImMap::new(),
-      stack_depth: 16,
-      label_counter: &label_counter,
-  };
-  jit_compile_and_run_with_defines(expr, &context, ops, labels)
-}
-
 
 fn jit_load_function(defn: &Defn, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<dynasmrt::AssemblyOffset, CompileError> {
     let instrs = compile_defn(defn, context)?;
