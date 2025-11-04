@@ -42,7 +42,7 @@ struct Context<'a> {
     define_env: &'a DefineEnv,
     env: &'a Env,
     stack_depth: i32,
-    label_counter: &'a RefCell<u32>,
+    label_counter: &'a RefCell<u32>, // Lots of choices!
 }
 
 #[derive(Debug, Clone)]
@@ -60,13 +60,13 @@ enum Instr {
 }
 
 #[derive(Debug)]
-enum Defn {
-    Defn2(String, String, String, Expr)
+enum Defn<T> {
+    Defn2(String, String, String, Expr<T>)
 }
 
 #[derive(Debug)]
-enum Prog {
-    Prog(Vec<Defn>, Expr)
+enum Prog<T> {
+    Prog(Vec<Defn<T>>, Expr<T>)
 }
 
 #[derive(Debug)]
@@ -79,83 +79,86 @@ enum BinOp {
 }
 
 #[derive(Debug)]
-enum Expr {
-  Num(i32),
-  True,
-  False,
-  Add1(Box<Expr>),
-  Sub1(Box<Expr>),
-  Add(Box<Expr>, Box<Expr>),
-  Binop(BinOp, Box<Expr>, Box<Expr>),
-  Id(String),
-  Let(String, Box<Expr>, Box<Expr>), // let var = expr1 in expr2
-  Call2(String, Box<Expr>, Box<Expr>),
-  If(Box<Expr>, Box<Expr>, Box<Expr>),
-  Loop(Box<Expr>),
-  Break(Box<Expr>)
+enum Expr<T> {
+  Num(T, i32),
+  True(T),
+  False(T),
+  Add1(T, Box<Expr<T>>),
+  Sub1(T, Box<Expr<T>>),
+  Add(T, Box<Expr<T>>, Box<Expr<T>>),
+  Binop(T, BinOp, Box<Expr<T>>, Box<Expr<T>>),
+  Id(T, String),
+  Let(T, String, Box<Expr<T>>, Box<Expr<T>>), // let var = expr1 in expr2
+  Call2(T, String, Box<Expr<T>>, Box<Expr<T>>),
+  If(T, Box<Expr<T>>, Box<Expr<T>>, Box<Expr<T>>),
+  Loop(T, Box<Expr<T>>),
+  Break(T, Box<Expr<T>>),
+  Set(T, String, Box<Expr<T>>) // set! var expr
 }
 
 #[derive(Debug)]
-enum ReplEntry {
-  Define(String, Expr),
-  Fun(Defn),
-  Expression(Expr),
+enum ReplEntry<T> {
+  Define(String, Expr<T>),
+  Fun(Defn<T>),
+  Expression(Expr<T>),
 }
 
-fn parse_expr(s : &Sexp) -> Result<Expr, ParseError> {
+fn parse_expr(s : &Sexp) -> Result<Expr<()>, ParseError> {
   match s {
     Sexp::Atom(I(n)) => {
       match i32::try_from(*n) {
-        Ok(num) => Ok(Expr::Num(num)),
+        Ok(num) => Ok(Expr::Num((), num)),
         Err(_) => Err(ParseError::NumberTooLarge)
       }
     },
     Sexp::Atom(S(name)) => {
       match name.as_str() {
-        "true" => Ok(Expr::True),
-        "false" => Ok(Expr::False),
-        _ => Ok(Expr::Id(name.to_string()))
+        "true" => Ok(Expr::True(())),
+        "false" => Ok(Expr::False(())),
+        _ => Ok(Expr::Id((), name.to_string()))
       }
     },
     Sexp::List(vec) =>
       match &vec[..] {
         [Sexp::Atom(S(op)), e] if op == "add1" =>
-          Ok(Expr::Add1(Box::new(parse_expr(e)?))),
+          Ok(Expr::Add1((), Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), e] if op == "sub1" =>
-          Ok(Expr::Sub1(Box::new(parse_expr(e)?))),
+          Ok(Expr::Sub1((), Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
-          Ok(Expr::Add(Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Add((), Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "<" =>
-          Ok(Expr::Binop(BinOp::Less, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Binop((), BinOp::Less, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == ">" =>
-          Ok(Expr::Binop(BinOp::Greater, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Binop((), BinOp::Greater, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "=" =>
-          Ok(Expr::Binop(BinOp::Equal, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Binop((), BinOp::Equal, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "*" =>
-          Ok(Expr::Binop(BinOp::Mult, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Binop((), BinOp::Mult, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "-" =>
-          Ok(Expr::Binop(BinOp::Minus, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Binop((), BinOp::Minus, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), condition, then_expr, else_expr] if op == "if" =>
-          Ok(Expr::If(Box::new(parse_expr(condition)?), Box::new(parse_expr(then_expr)?), Box::new(parse_expr(else_expr)?))),
+          Ok(Expr::If((), Box::new(parse_expr(condition)?), Box::new(parse_expr(then_expr)?), Box::new(parse_expr(else_expr)?))),
         [Sexp::Atom(S(op)), e] if op == "loop" =>
-          Ok(Expr::Loop(Box::new(parse_expr(e)?))),
+          Ok(Expr::Loop((), Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), e] if op == "break" =>
-          Ok(Expr::Break(Box::new(parse_expr(e)?))),
+          Ok(Expr::Break((), Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(op)), Sexp::List(binding), body] if op == "let" =>
           match &binding[..] {
             [Sexp::Atom(S(var)), val] =>
-              Ok(Expr::Let(var.to_string(), Box::new(parse_expr(val)?), Box::new(parse_expr(body)?))),
+              Ok(Expr::Let((), var.to_string(), Box::new(parse_expr(val)?), Box::new(parse_expr(body)?))),
             _ => Err(ParseError::InvalidLetBinding)
           },
+        [Sexp::Atom(S(op)), Sexp::Atom(S(var)), val] if op == "set!" =>
+          Ok(Expr::Set((), var.to_string(), Box::new(parse_expr(val)?))),
         [Sexp::Atom(S(fun_name)), arg1, arg2] =>
-          Ok(Expr::Call2(fun_name.to_string(), Box::new(parse_expr(arg1)?), Box::new(parse_expr(arg2)?))),
+          Ok(Expr::Call2((), fun_name.to_string(), Box::new(parse_expr(arg1)?), Box::new(parse_expr(arg2)?))),
   	_ => Err(ParseError::InvalidSyntax(format!("Unknown expression: {:?}", vec)))
 	},
     _ => Err(ParseError::InvalidSyntax(format!("Invalid atom: {:?}", s)))
   }
 }
 
-fn parse_defn(s: &Sexp) -> Result<Defn, ParseError> {
+fn parse_defn(s: &Sexp) -> Result<Defn<()>, ParseError> {
     match s {
         Sexp::List(vec) => {
             if vec.len() != 3 {
@@ -182,13 +185,13 @@ fn parse_defn(s: &Sexp) -> Result<Defn, ParseError> {
     }
 }
 
-fn parse_program(s: &Sexp) -> Result<Prog, ParseError> {
+fn parse_program(s: &Sexp) -> Result<Prog<()>, ParseError> {
     match s {
         Sexp::List(vec) => {
             if vec.len() < 1 {
                 return Err(ParseError::InvalidSyntax("Program must have at least one expression.".to_string()));
             }
-            let defns: Result<Vec<Defn>, ParseError> = vec[..vec.len() - 1]
+            let defns: Result<Vec<Defn<()>>, ParseError> = vec[..vec.len() - 1]
                 .iter()
                 .map(|defn| parse_defn(defn))
                 .collect();
@@ -199,7 +202,7 @@ fn parse_program(s: &Sexp) -> Result<Prog, ParseError> {
     }
 }
 
-fn parse_repl_entry(s: &Sexp) -> Result<ReplEntry, ParseError> {
+fn parse_repl_entry(s: &Sexp) -> Result<ReplEntry<()>, ParseError> {
   match s {
     Sexp::List(vec) => {
       match &vec[..] {
@@ -271,7 +274,7 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
     .join("\n")
 }
 
-fn compile_defn(d: &Defn, context: &Context) -> Result<Vec<Instr>, CompileError> {
+fn compile_defn(d: &Defn<()>, context: &Context) -> Result<Vec<Instr>, CompileError> {
     match d {
         Defn::Defn2(name, arg1, arg2, body) =>  {
             let body_env : ImMap<String, i32> = immap!{arg1.clone() => 8, arg2.clone() => 16};
@@ -292,16 +295,16 @@ fn compile_defn(d: &Defn, context: &Context) -> Result<Vec<Instr>, CompileError>
     }
 }
 
-fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, CompileError> {
+fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, CompileError> {
   match e {
-	Expr::Num(n) => Ok(vec![Instr::Mov(Reg::Rax, *n)]),
-	Expr::True => panic!("Code generation for boolean true not implemented yet"),
-	Expr::False => panic!("Code generation for boolean false not implemented yet"),
-	Expr::Binop(op, e1, e2) => panic!("Code generation for binary operators not implemented yet"),
-	Expr::If(condition, then_expr, else_expr) => panic!("Code generation for if expressions not implemented yet"),
-	Expr::Loop(body) => panic!("Code generation for loop expressions not implemented yet"),
-	Expr::Break(value) => panic!("Code generation for break expressions not implemented yet"),
-	Expr::Id(name) => {
+	Expr::Num(_, n) => Ok(vec![Instr::Mov(Reg::Rax, *n * 2)]),
+	Expr::True(_) => Ok(vec![Instr::Mov(Reg::Rax, 3)]),
+	Expr::False(_) =>  Ok(vec![Instr::Mov(Reg::Rax, 1)]),
+	Expr::Binop(_, op, e1, e2) => panic!("Code generation for binary operators not implemented yet"),
+	Expr::If(_, condition, then_expr, else_expr) => panic!("Code generation for if expressions not implemented yet"),
+	Expr::Loop(_, body) => panic!("Code generation for loop expressions not implemented yet"),
+	Expr::Break(_, value) => panic!("Code generation for break expressions not implemented yet"),
+	Expr::Id(_, name) => {
       match context.env.get(name) {
         Some(offset) => Ok(vec![Instr::MovFromStack(Reg::Rax, *offset)]),
         None => {
@@ -316,17 +319,17 @@ fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, Comp
         }
       }
     },
-	Expr::Add1(subexpr) => {
+	Expr::Add1(_, subexpr) => {
       let mut instrs = compile_expr_with_env(subexpr, context)?;
       instrs.push(Instr::Add(Reg::Rax, 1));
       Ok(instrs)
     },
-	Expr::Sub1(subexpr) => {
+	Expr::Sub1(_, subexpr) => {
       let mut instrs = compile_expr_with_env(subexpr, context)?;
       instrs.push(Instr::Sub(Reg::Rax, 1));
       Ok(instrs)
     },
-	Expr::Add(e1, e2) => {
+	Expr::Add(_, e1, e2) => {
       let mut instrs = compile_expr_with_env(e1, context)?;  // Compile first expr
       instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));                     // Store result at current stack depth
       let new_context = Context { stack_depth: context.stack_depth + 8, ..*context };
@@ -335,7 +338,7 @@ fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, Comp
       instrs.push(Instr::AddReg(Reg::Rax, Reg::Rcx));                           // Add rcx to rax
       Ok(instrs)
     },
-    Expr::Let(var, val_expr, body_expr) => {
+    Expr::Let(_, var, val_expr, body_expr) => {
       let mut instrs = compile_expr_with_env(val_expr, context)?;  // Compile value expression
       instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));                           // Store value on stack
       
@@ -351,7 +354,7 @@ fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, Comp
       instrs.extend(compile_expr_with_env(body_expr, &new_context)?); // Compile body with extended env
       Ok(instrs)
     },
-    Expr::Call2(fun, arg1, arg2) => {
+    Expr::Call2(_, fun, arg1, arg2) => {
         let stack_depth = context.stack_depth;
         let extra_depth = if stack_depth % 16 == 0 { 0 } else { 16 - stack_depth % 16 };
         let fixed_depth = extra_depth + stack_depth;
@@ -376,11 +379,24 @@ fn compile_expr_with_env(e: &Expr, context: &Context) -> Result<Vec<Instr>, Comp
             Instr::Add(Reg::Rsp, fixed_depth)
         ]);
         Ok(instrs1)
+    },
+    Expr::Set(_, var, val_expr) => {
+      let mut instrs = compile_expr_with_env(val_expr, context)?;
+      
+      match context.env.get(var) {
+        Some(offset) => {
+          instrs.push(Instr::MovToStack(Reg::Rax, *offset));
+          Ok(instrs)
+        },
+        None => {
+          Err(CompileError::UnboundVariable(var.clone()))
+        }
+      }
     }
   }
 }
 
-fn compile_program(prog: &Prog) -> Result<(Vec<Instr>, Vec<Instr>), CompileError> {
+fn compile_program(prog: &Prog<()>) -> Result<(Vec<Instr>, Vec<Instr>), CompileError> {
   match prog {
       Prog::Prog(defns, expr) => {
           let mut instrs: Vec<Instr> = Vec::new();
@@ -424,6 +440,92 @@ our_code_starts_here:
   out_file.write_all(asm_program.as_bytes())?;
 
   Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Type {
+    Nothing,
+    Num,
+    Bool,
+    Unknown
+}
+
+fn t_of<T>(expr: &Expr<T>) -> &T {
+    match expr {
+        Expr::Num(t, _) => t,
+        Expr::True(t) => t,
+        Expr::False(t) => t,
+        Expr::Add1(t, _) => t,
+        Expr::Sub1(t, _) => t,
+        Expr::Add(t, _, _) => t,
+        Expr::Binop(t, _, _, _) => t,
+        Expr::Id(t, _) => t,
+        Expr::Let(t, _, _, _) => t,
+        Expr::Call2(t, _, _, _) => t,
+        Expr::If(t, _, _, _) => t,
+        Expr::Loop(t, _) => t,
+        Expr::Break(t, _) => t,
+        Expr::Set(t, _, _) => t,
+    }
+}
+
+fn ty_union(t1: &Type, t2: &Type) -> Type {
+    match (*t1, *t2) {
+        (Type::Num, Type::Num) => Type::Num,
+        (Type::Bool, Type::Bool) => Type::Bool,
+        (t, Type::Nothing) => t,
+        (Type::Nothing, t) => t,
+        (_, Type::Unknown) => Type::Unknown,
+        (Type::Unknown, _) => Type::Unknown,
+        _ => Type::Unknown,
+    }
+}
+
+struct TypeEnv {
+    env: ImMap<String, Type>,
+}
+
+
+fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> (Expr<Type>, Type) {
+    match e {
+        Expr::Num(_, n) => (Expr::Num(Type::Num, *n), Type::Nothing),
+        Expr::True(_) => (Expr::True(Type::Bool), Type::Nothing),
+        Expr::False(_) => (Expr::False(Type::Bool), Type::Bool),
+        Expr::Add1(_, e) => {
+            let (expr, breaks) = calc_type(e, type_env);
+            (Expr::Add1(Type::Num, Box::new(expr)), breaks)
+        },
+        Expr::Add(_, e1, e2) => {
+            let (expr1, breaks1) = calc_type(e1, type_env);
+            let (expr2, breaks2) = calc_type(e2, type_env);
+            (Expr::Add(Type::Num, Box::new(expr1), Box::new(expr2)), ty_union(&breaks1, &breaks2))
+        },
+        Expr::If(_, e1, e2, e3) => {
+            let (expr1, breaks1) = calc_type(e1, type_env);
+            let (expr2, breaks2) = calc_type(e2, type_env);
+            let (expr3, breaks3) = calc_type(e3, type_env);
+            let if_typ = ty_union(t_of(&expr2), t_of(&expr3));
+            (Expr::If(if_typ, Box::new(expr1), Box::new(expr2), Box::new(expr3)), ty_union(&breaks1, &ty_union(&breaks2, &breaks3)))
+        },
+        Expr::Let(_, name, e1, e2) => {
+            let (expr1, breaks1) = calc_type(e1, type_env);
+            let new_env = TypeEnv { env: type_env.env.update(name.clone(), *t_of(&expr1)) };
+            let (expr2, breaks2) = calc_type(e2, type_env);
+            (Expr::Let(Type::Nothing, name.clone(), Box::new(expr1), Box::new(expr2)), ty_union(&breaks1, &breaks2))
+        },
+        Expr::Loop(_, e) => {
+            let (expr, breaks) = calc_type(e, type_env);
+            (Expr::Loop(breaks, Box::new(expr)), Type::Nothing)
+        },
+        Expr::Break(_, e) => {
+            let (expr, breaks) = calc_type(e, type_env);
+            (Expr::Break(Type::Nothing, Box::new(expr)), *t_of(&expr))
+        },
+        Expr::Set(_, name, e) => {
+            let (expr, breaks) = calc_type(e, type_env);
+            (Expr::Set(*t_of(&expr), name.clone(), Box::new(expr)), breaks)
+        }
+    }
 }
 
 fn get_or_create_label(ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>, str: &str) -> DynamicLabel {
@@ -491,7 +593,7 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels
   }
 }
 
-fn jit_compile_and_run_program(program: &Prog, ops : &mut dynasmrt::x64::Assembler) -> Result<i64, CompileError> {
+fn jit_compile_and_run_program(program: &Prog<()>, ops : &mut dynasmrt::x64::Assembler) -> Result<i64, CompileError> {
     let mut labels = HashMap::new();
     match program {
         Prog::Prog(defs, main) => {
@@ -511,7 +613,7 @@ fn jit_compile_and_run_program(program: &Prog, ops : &mut dynasmrt::x64::Assembl
     
 }
 
-fn jit_load_function(defn: &Defn, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<dynasmrt::AssemblyOffset, CompileError> {
+fn jit_load_function(defn: &Defn<()>, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<dynasmrt::AssemblyOffset, CompileError> {
     let instrs = compile_defn(defn, context)?;
     println!("Compiled function\n{}", instrs_to_string(&instrs));
     let start = ops.offset();
@@ -543,7 +645,7 @@ fn jit_run_instrs(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, label
     
 }
 
-fn jit_compile_and_run_with_defines(expr: &Expr, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
+fn jit_compile_and_run_with_defines(expr: &Expr<()>, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
   // Compile expression to instructions using existing compiler
   let instrs = compile_expr_with_env(expr, context)?;
   println!("Compiled\n{}", instrs_to_string(&instrs));
