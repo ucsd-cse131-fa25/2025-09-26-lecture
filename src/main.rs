@@ -25,6 +25,7 @@ enum ParseError {
 #[derive(Debug)]
 enum CompileError {
   UnboundVariable(String),
+  TypeError(Type, Type)
 }
 
 #[derive(Debug, Clone)]
@@ -60,8 +61,14 @@ enum Instr {
 }
 
 #[derive(Debug)]
+enum Arg {
+    Name(String),
+    Annot(String, String)
+}
+
+#[derive(Debug)]
 enum Defn<T> {
-    Defn2(String, String, String, Expr<T>)
+    Defn2(String, Arg, Arg, Expr<T>)
 }
 
 #[derive(Debug)]
@@ -78,7 +85,7 @@ enum BinOp {
   Minus
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Expr<T> {
   Num(T, i32),
   True(T),
@@ -170,7 +177,7 @@ fn parse_defn(s: &Sexp) -> Result<Defn<()>, ParseError> {
                         match (&args[0], &args[1], &args[2]) {
                             (Sexp::Atom(S(name)), Sexp::Atom(S(arg1)), Sexp::Atom(S(arg2))) => {
                                 let expr = parse_expr(body)?;
-                                Ok(Defn::Defn2(name.to_string(), arg1.to_string(), arg2.to_string(), expr))
+                                Ok(Defn::Defn2(name.to_string(), Arg::Name(arg1.to_string()), Arg::Name(arg2.to_string()), expr))
                             }
                             _ => Err(ParseError::InvalidSyntax("Invalid argument structure in definition.".to_string())),
                         }
@@ -274,10 +281,17 @@ fn instrs_to_string(instrs: &Vec<Instr>) -> String {
     .join("\n")
 }
 
+fn arg_name(a : &Arg) -> String {
+    match a {
+        Arg::Name(s) => s.clone(),
+        Arg::Annot(s, _) => s.clone()
+    }
+}
+
 fn compile_defn(d: &Defn<()>, context: &Context) -> Result<Vec<Instr>, CompileError> {
     match d {
         Defn::Defn2(name, arg1, arg2, body) =>  {
-            let body_env : ImMap<String, i32> = immap!{arg1.clone() => 8, arg2.clone() => 16};
+            let body_env : ImMap<String, i32> = immap!{arg_name(arg1) => 8, arg_name(arg2) => 16};
             let new_context = Context {
                 define_env: context.define_env,
                 env: &body_env,
@@ -481,10 +495,22 @@ fn ty_union(t1: &Type, t2: &Type) -> Type {
     }
 }
 
+fn is_subtype(t1: &Type, t2: &Type) -> bool {
+    match (*t1, *t2) {
+        (_, Type:: Unknown) => true,
+        (Type::Nothing, _) => true,
+        (_, _) => t1 == t2
+    }
+}
+
+fn check_typ(t1 : &Type, t2 : &Type) -> Result<(), CompileError> {
+    if !is_subtype(t1, t2) { Err(CompileError::TypeError(*t1, *t2)) }
+    else { Ok(()) }
+}
+
 struct TypeEnv {
     env: ImMap<String, Type>,
 }
-
 
 fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> (Expr<Type>, Type) {
     match e {
@@ -493,17 +519,21 @@ fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> (Expr<Type>, Type) {
         Expr::False(_) => (Expr::False(Type::Bool), Type::Bool),
         Expr::Add1(_, e) => {
             let (expr, breaks) = calc_type(e, type_env);
+            check_typ(t_of(&expr), &Type::Num);
             (Expr::Add1(Type::Num, Box::new(expr)), breaks)
         },
         Expr::Add(_, e1, e2) => {
             let (expr1, breaks1) = calc_type(e1, type_env);
             let (expr2, breaks2) = calc_type(e2, type_env);
+            check_typ(t_of(&expr1), &Type::Num);
+            check_typ(t_of(&expr2), &Type::Num);
             (Expr::Add(Type::Num, Box::new(expr1), Box::new(expr2)), ty_union(&breaks1, &breaks2))
         },
         Expr::If(_, e1, e2, e3) => {
             let (expr1, breaks1) = calc_type(e1, type_env);
             let (expr2, breaks2) = calc_type(e2, type_env);
             let (expr3, breaks3) = calc_type(e3, type_env);
+            check_typ(t_of(&expr1), &Type::Bool);
             let if_typ = ty_union(t_of(&expr2), t_of(&expr3));
             (Expr::If(if_typ, Box::new(expr1), Box::new(expr2), Box::new(expr3)), ty_union(&breaks1, &ty_union(&breaks2, &breaks3)))
         },
@@ -519,12 +549,14 @@ fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> (Expr<Type>, Type) {
         },
         Expr::Break(_, e) => {
             let (expr, breaks) = calc_type(e, type_env);
-            (Expr::Break(Type::Nothing, Box::new(expr)), *t_of(&expr))
+            let typ = *t_of(&expr);
+            (Expr::Break(Type::Nothing, Box::new(expr)), ty_union(&typ, &breaks))
         },
         Expr::Set(_, name, e) => {
             let (expr, breaks) = calc_type(e, type_env);
             (Expr::Set(*t_of(&expr), name.clone(), Box::new(expr)), breaks)
-        }
+        },
+        _ => { panic!("TC not yet implemented for {:?}", e) }
     }
 }
 
