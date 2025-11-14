@@ -33,6 +33,9 @@ enum Reg {
     Rax,
     Rcx,
     Rsp,
+    Rdi,
+    Rsi,
+    Rdx,
 }
 
 type Env = ImMap<String, i32>;
@@ -52,12 +55,20 @@ enum Instr {
   Add(Reg, i32),         // add register, immediate
   Sub(Reg, i32),         // sub register, immediate
   Jmp(String),           // Unconditional jump to label
+  Jnz(String),           // Jump to label if not zero
   JmpReg(Reg),           // Unconditional jump to instrution pointer at address of register
   AddReg(Reg, Reg),      // add register, register
   MovToStack(Reg, i32),  // mov [rsp - offset], register
   MovLabelToStack(String, i32),  // mov [rsp - offset], label value
   MovFromStack(Reg, i32), // mov register, [rsp - offset]
   Label(String),         // label definition
+  And(Reg, i32),         // and register, immediate
+  AndReg(Reg, Reg),      // and register, register
+  Test(Reg, i32),        // test register, immediate
+  Cmovnz(Reg, i32),      // conditional move if not zero
+  CmovnzReg(Reg, Reg),   // conditional move if not zero (register to register)
+  Cmp(Reg, Reg),         // compare two registers
+  Cmovl(Reg, i32),       // conditional move if less than
 }
 
 #[derive(Debug)]
@@ -76,15 +87,6 @@ enum Prog<T> {
     Prog(Vec<Defn<T>>, Expr<T>)
 }
 
-#[derive(Debug)]
-enum BinOp {
-  Less,
-  Greater,
-  Equal,
-  Mult,
-  Minus
-}
-
 #[derive(Debug, Clone)]
 enum Expr<T> {
   Num(T, i32),
@@ -93,14 +95,14 @@ enum Expr<T> {
   Add1(T, Box<Expr<T>>),
   Sub1(T, Box<Expr<T>>),
   Add(T, Box<Expr<T>>, Box<Expr<T>>),
-  Binop(T, BinOp, Box<Expr<T>>, Box<Expr<T>>),
+  Less(T, Box<Expr<T>>, Box<Expr<T>>),
   Id(T, String),
-  Let(T, String, Box<Expr<T>>, Box<Expr<T>>), // let var = expr1 in expr2
+  Let(T, String, Box<Expr<T>>, Box<Expr<T>>),
   Call2(T, String, Box<Expr<T>>, Box<Expr<T>>),
   If(T, Box<Expr<T>>, Box<Expr<T>>, Box<Expr<T>>),
   Loop(T, Box<Expr<T>>),
   Break(T, Box<Expr<T>>),
-  Set(T, String, Box<Expr<T>>) // set! var expr
+  Set(T, String, Box<Expr<T>>)
 }
 
 #[derive(Debug)]
@@ -134,15 +136,7 @@ fn parse_expr(s : &Sexp) -> Result<Expr<()>, ParseError> {
         [Sexp::Atom(S(op)), e1, e2] if op == "+" =>
           Ok(Expr::Add((), Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), e1, e2] if op == "<" =>
-          Ok(Expr::Binop((), BinOp::Less, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
-        [Sexp::Atom(S(op)), e1, e2] if op == ">" =>
-          Ok(Expr::Binop((), BinOp::Greater, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
-        [Sexp::Atom(S(op)), e1, e2] if op == "=" =>
-          Ok(Expr::Binop((), BinOp::Equal, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
-        [Sexp::Atom(S(op)), e1, e2] if op == "*" =>
-          Ok(Expr::Binop((), BinOp::Mult, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
-        [Sexp::Atom(S(op)), e1, e2] if op == "-" =>
-          Ok(Expr::Binop((), BinOp::Minus, Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
+          Ok(Expr::Less((), Box::new(parse_expr(e1)?), Box::new(parse_expr(e2)?))),
         [Sexp::Atom(S(op)), condition, then_expr, else_expr] if op == "if" =>
           Ok(Expr::If((), Box::new(parse_expr(condition)?), Box::new(parse_expr(then_expr)?), Box::new(parse_expr(else_expr)?))),
         [Sexp::Atom(S(op)), e] if op == "loop" =>
@@ -241,6 +235,9 @@ fn reg_to_string(reg: &Reg) -> &str {
     Reg::Rax => "rax",
     Reg::Rcx => "rcx",
     Reg::Rsp => "rsp",
+    Reg::Rdi => "rdi",
+    Reg::Rsi => "rsi",
+    Reg::Rdx => "rdx",
   }
 }
 
@@ -249,6 +246,9 @@ fn reg_to_num(reg: &Reg) -> u8 {
     Reg::Rax => 0,
     Reg::Rcx => 3,
     Reg::Rsp => 4,
+    Reg::Rdi => 7,
+    Reg::Rsi => 6,
+    Reg::Rdx => 2,
   }
 }
 
@@ -263,7 +263,15 @@ fn instr_to_string(instr: &Instr) -> String {
     Instr::MovFromStack(reg, offset) => format!("mov {}, [rsp - {}]", reg_to_string(reg), offset),
     Instr::Label(name) => format!("{name}: "),
     Instr::Jmp(name) => format!("jmp {name}"),
+    Instr::Jnz(name) => format!("jnz {name}"),
     Instr::JmpReg(reg) => format!("jmp [{}]", reg_to_string(reg)),
+    Instr::And(reg, val) => format!("and {}, {}", reg_to_string(reg), val),
+    Instr::AndReg(reg1, reg2) => format!("and {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
+    Instr::Test(reg, val) => format!("test {}, {}", reg_to_string(reg), val),
+    Instr::Cmovnz(reg, val) => format!("mov rcx, {}\ncmovnz {}, rcx", val, reg_to_string(reg)),
+    Instr::CmovnzReg(reg1, reg2) => format!("cmovnz {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
+    Instr::Cmp(reg1, reg2) => format!("cmp {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
+    Instr::Cmovl(reg, val) => format!("mov rcx, {}\ncmovl {}, rcx", val, reg_to_string(reg)),
   }
 }
 
@@ -314,7 +322,6 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
 	Expr::Num(_, n) => Ok(vec![Instr::Mov(Reg::Rax, *n * 2)]),
 	Expr::True(_) => Ok(vec![Instr::Mov(Reg::Rax, 3)]),
 	Expr::False(_) =>  Ok(vec![Instr::Mov(Reg::Rax, 1)]),
-	Expr::Binop(_, op, e1, e2) => panic!("Code generation for binary operators not implemented yet"),
 	Expr::If(_, condition, then_expr, else_expr) => panic!("Code generation for if expressions not implemented yet"),
 	Expr::Loop(_, body) => panic!("Code generation for loop expressions not implemented yet"),
 	Expr::Break(_, value) => panic!("Code generation for break expressions not implemented yet"),
@@ -344,12 +351,48 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
       Ok(instrs)
     },
 	Expr::Add(_, e1, e2) => {
-      let mut instrs = compile_expr_with_env(e1, context)?;  // Compile first expr
-      instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));                     // Store result at current stack depth
+      let mut instrs = compile_expr_with_env(e1, context)?;
+      instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));
       let new_context = Context { stack_depth: context.stack_depth + 8, ..*context };
-      instrs.extend(compile_expr_with_env(e2, &new_context)?); // Compile second expr with incremented depth
-      instrs.push(Instr::MovFromStack(Reg::Rcx, context.stack_depth));                   // Load first result into rcx
-      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rcx));                           // Add rcx to rax
+      instrs.extend(compile_expr_with_env(e2, &new_context)?);
+      // Tag checks
+      instrs.extend(vec![
+        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+        Instr::AndReg(Reg::Rcx, Reg::Rax),
+        Instr::Test(Reg::Rcx, 1),
+        Instr::Cmovnz(Reg::Rdi, 1),
+        Instr::CmovnzReg(Reg::Rsi, Reg::Rax),
+        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+        Instr::CmovnzReg(Reg::Rdx, Reg::Rcx),
+        Instr::Jnz("snek_err".to_string()),
+      ]);
+      // Do the add
+      instrs.push(Instr::AddReg(Reg::Rax, Reg::Rcx));
+      Ok(instrs)
+    },
+    Expr::Less(_, e1, e2) => {
+      let mut instrs = compile_expr_with_env(e1, context)?;
+      instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));
+      let new_context = Context { stack_depth: context.stack_depth + 8, ..*context };
+      instrs.extend(compile_expr_with_env(e2, &new_context)?);
+      // Tag checks
+      instrs.extend(vec![
+        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+        Instr::AndReg(Reg::Rcx, Reg::Rax),
+        Instr::Test(Reg::Rcx, 1),
+        Instr::Cmovnz(Reg::Rdi, 1),
+        Instr::CmovnzReg(Reg::Rsi, Reg::Rax),
+        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+        Instr::CmovnzReg(Reg::Rdx, Reg::Rcx),
+        Instr::Jnz("snek_err".to_string()),
+      ]);
+      // Do the comparison
+      instrs.extend(vec![
+        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+        Instr::Cmp(Reg::Rcx, Reg::Rax),  // Compare rcx with rax
+        Instr::Mov(Reg::Rax, 1),         // Set false by default
+        Instr::Cmovl(Reg::Rax, 3),       // Set true if rcx < rax
+      ]);
       Ok(instrs)
     },
     Expr::Let(_, var, val_expr, body_expr) => {
@@ -443,6 +486,7 @@ fn compile_mode(in_name: &str, out_name: &str) -> std::io::Result<()> {
   let (defs, main) = compile_program(&prog).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   let asm_program = format!("
 section .text
+extern snek_err
 global our_code_starts_here
 {}
 our_code_starts_here:
@@ -472,7 +516,7 @@ fn t_of<T>(expr: &Expr<T>) -> &T {
         Expr::Add1(t, _) => t,
         Expr::Sub1(t, _) => t,
         Expr::Add(t, _, _) => t,
-        Expr::Binop(t, _, _, _) => t,
+        Expr::Less(t, _, _) => t,
         Expr::Id(t, _) => t,
         Expr::Let(t, _, _, _) => t,
         Expr::Call2(t, _, _, _) => t,
@@ -514,49 +558,20 @@ struct TypeEnv {
 
 fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> (Expr<Type>, Type) {
     match e {
-        Expr::Num(_, n) => (Expr::Num(Type::Num, *n), Type::Nothing),
-        Expr::True(_) => (Expr::True(Type::Bool), Type::Nothing),
-        Expr::False(_) => (Expr::False(Type::Bool), Type::Bool),
-        Expr::Add1(_, e) => {
-            let (expr, breaks) = calc_type(e, type_env);
-            check_typ(t_of(&expr), &Type::Num);
-            (Expr::Add1(Type::Num, Box::new(expr)), breaks)
-        },
-        Expr::Add(_, e1, e2) => {
-            let (expr1, breaks1) = calc_type(e1, type_env);
-            let (expr2, breaks2) = calc_type(e2, type_env);
-            check_typ(t_of(&expr1), &Type::Num);
-            check_typ(t_of(&expr2), &Type::Num);
-            (Expr::Add(Type::Num, Box::new(expr1), Box::new(expr2)), ty_union(&breaks1, &breaks2))
-        },
-        Expr::If(_, e1, e2, e3) => {
-            let (expr1, breaks1) = calc_type(e1, type_env);
-            let (expr2, breaks2) = calc_type(e2, type_env);
-            let (expr3, breaks3) = calc_type(e3, type_env);
-            check_typ(t_of(&expr1), &Type::Bool);
-            let if_typ = ty_union(t_of(&expr2), t_of(&expr3));
-            (Expr::If(if_typ, Box::new(expr1), Box::new(expr2), Box::new(expr3)), ty_union(&breaks1, &ty_union(&breaks2, &breaks3)))
-        },
-        Expr::Let(_, name, e1, e2) => {
-            let (expr1, breaks1) = calc_type(e1, type_env);
-            let new_env = TypeEnv { env: type_env.env.update(name.clone(), *t_of(&expr1)) };
-            let (expr2, breaks2) = calc_type(e2, type_env);
-            (Expr::Let(Type::Nothing, name.clone(), Box::new(expr1), Box::new(expr2)), ty_union(&breaks1, &breaks2))
-        },
-        Expr::Loop(_, e) => {
-            let (expr, breaks) = calc_type(e, type_env);
-            (Expr::Loop(breaks, Box::new(expr)), Type::Nothing)
-        },
-        Expr::Break(_, e) => {
-            let (expr, breaks) = calc_type(e, type_env);
-            let typ = *t_of(&expr);
-            (Expr::Break(Type::Nothing, Box::new(expr)), ty_union(&typ, &breaks))
-        },
-        Expr::Set(_, name, e) => {
-            let (expr, breaks) = calc_type(e, type_env);
-            (Expr::Set(*t_of(&expr), name.clone(), Box::new(expr)), breaks)
-        },
-        _ => { panic!("TC not yet implemented for {:?}", e) }
+        Expr::Num(_, _) => todo!(),
+        Expr::True(_) => todo!(),
+        Expr::False(_) => todo!(),
+        Expr::Add1(_, expr) => todo!(),
+        Expr::Sub1(_, expr) => todo!(),
+        Expr::Add(_, expr, expr1) => todo!(),
+        Expr::Less(_, expr, expr1) => todo!(),
+        Expr::Id(_, _) => todo!(),
+        Expr::Let(_, _, expr, expr1) => todo!(),
+        Expr::Call2(_, _, expr, expr1) => todo!(),
+        Expr::If(_, expr, expr1, expr2) => todo!(),
+        Expr::Loop(_, expr) => todo!(),
+        Expr::Break(_, expr) => todo!(),
+        Expr::Set(_, _, expr) => todo!(),
     }
 }
 
@@ -617,9 +632,44 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels
           let label = get_or_create_label(ops, labels, str);
           dynasm!(ops ; .arch x64 ; jmp =>label)
       }
+      Instr::Jnz(str) => {
+          let label = get_or_create_label(ops, labels, str);
+          dynasm!(ops ; .arch x64 ; jnz =>label)
+      }
       Instr::JmpReg(reg) => {
           let reg_num = reg_to_num(reg);
           dynasm!(ops ; .arch x64 ; mov rcx, [Rq(reg_num)]; jmp rcx);
+      }
+      Instr::And(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; and Rq(reg_num), *val);
+      }
+      Instr::AndReg(reg1, reg2) => {
+        let reg1_num = reg_to_num(reg1);
+        let reg2_num = reg_to_num(reg2);
+        dynasm!(ops ; .arch x64 ; and Rq(reg1_num), Rq(reg2_num));
+      }
+      Instr::Test(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; test Rq(reg_num), *val);
+      }
+      Instr::Cmovnz(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; mov rcx, *val ; cmovnz Rq(reg_num), rcx);
+      }
+      Instr::CmovnzReg(reg1, reg2) => {
+        let reg1_num = reg_to_num(reg1);
+        let reg2_num = reg_to_num(reg2);
+        dynasm!(ops ; .arch x64 ; cmovnz Rq(reg1_num), Rq(reg2_num));
+      }
+      Instr::Cmp(reg1, reg2) => {
+        let reg1_num = reg_to_num(reg1);
+        let reg2_num = reg_to_num(reg2);
+        dynasm!(ops ; .arch x64 ; cmp Rq(reg1_num), Rq(reg2_num));
+      }
+      Instr::Cmovl(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; mov rcx, *val ; cmovl Rq(reg_num), rcx);
       }
     }
   }

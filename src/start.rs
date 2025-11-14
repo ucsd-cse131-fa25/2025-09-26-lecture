@@ -13,5 +13,3 @@ pub fn main() {
     let i : i64 = unsafe { our_code_starts_here()  };
     runtime::snek_print(i);
 }
-
-
