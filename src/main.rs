@@ -47,6 +47,7 @@ struct Context<'a> {
     env: &'a Env,
     stack_depth: i32,
     label_counter: &'a RefCell<u32>, // Lots of choices!
+    break_label: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,15 +73,15 @@ enum Instr {
   Cmovl(Reg, i32),       // conditional move if less than
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Arg {
     Name(String),
     Annot(String, String)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Defn<T> {
-    Defn2(String, Arg, Arg, Expr<T>)
+    Defn2(String, Arg, Arg, Option<String>, Expr<T>)
 }
 
 #[derive(Debug)]
@@ -163,24 +164,51 @@ fn parse_expr(s : &Sexp) -> Result<Expr<()>, ParseError> {
 fn parse_defn(s: &Sexp) -> Result<Defn<()>, ParseError> {
     match s {
         Sexp::List(vec) => {
-            if vec.len() != 3 {
-                return Err(ParseError::InvalidSyntax("Definition must have exactly 3 elements.".to_string()));
+            if vec.len() < 3 || vec.len() > 4 {
+                return Err(ParseError::InvalidSyntax("Definition must have 3 or 4 elements.".to_string()));
             }
-            match (&vec[0], &vec[1], &vec[2]) {
-                (Sexp::Atom(S(fun)), Sexp::List(args), body) if fun == "fun" => {
-                    if args.len() == 3 {
-                        match (&args[0], &args[1], &args[2]) {
-                            (Sexp::Atom(S(name)), Sexp::Atom(S(arg1)), Sexp::Atom(S(arg2))) => {
-                                let expr = parse_expr(body)?;
-                                Ok(Defn::Defn2(name.to_string(), Arg::Name(arg1.to_string()), Arg::Name(arg2.to_string()), expr))
+            
+            // Handle both (fun name (arg1 arg2) body) and (fun name (arg1 arg2) : return_type body)
+            match vec.len() {
+                3 => {
+                    // No return type: (fun name (arg1 arg2) body)
+                    match (&vec[0], &vec[1], &vec[2]) {
+                        (Sexp::Atom(S(fun)), Sexp::List(args), body) if fun == "fun" => {
+                            if args.len() == 3 {
+                                match (&args[0], &args[1], &args[2]) {
+                                    (Sexp::Atom(S(name)), Sexp::Atom(S(arg1)), Sexp::Atom(S(arg2))) => {
+                                        let expr = parse_expr(body)?;
+                                        Ok(Defn::Defn2(name.to_string(), Arg::Name(arg1.to_string()), Arg::Name(arg2.to_string()), None, expr))
+                                    }
+                                    _ => Err(ParseError::InvalidSyntax("Invalid argument structure in definition.".to_string())),
+                                }
+                            } else {
+                                Err(ParseError::InvalidSyntax("Definition arguments must have exactly 3 elements.".to_string()))
                             }
-                            _ => Err(ParseError::InvalidSyntax("Invalid argument structure in definition.".to_string())),
                         }
-                    } else {
-                        Err(ParseError::InvalidSyntax("Definition arguments must have exactly 3 elements.".to_string()))
+                        _ => Err(ParseError::InvalidSyntax("Invalid definition structure.".to_string())),
                     }
-                }
-                _ => Err(ParseError::InvalidSyntax("Invalid definition structure.".to_string())),
+                },
+                4 => {
+                    // With return type: (fun name (arg1 arg2) : return_type body)
+                    match (&vec[0], &vec[1], &vec[2], &vec[3]) {
+                        (Sexp::Atom(S(fun)), Sexp::List(args), Sexp::Atom(S(return_type)), body) if fun == "fun" => {
+                            if args.len() == 3 {
+                                match (&args[0], &args[1], &args[2]) {
+                                    (Sexp::Atom(S(name)), Sexp::Atom(S(arg1)), Sexp::Atom(S(arg2))) => {
+                                        let expr = parse_expr(body)?;
+                                        Ok(Defn::Defn2(name.to_string(), Arg::Name(arg1.to_string()), Arg::Name(arg2.to_string()), Some(return_type.to_string()), expr))
+                                    }
+                                    _ => Err(ParseError::InvalidSyntax("Invalid argument structure in definition.".to_string())),
+                                }
+                            } else {
+                                Err(ParseError::InvalidSyntax("Definition arguments must have exactly 3 elements.".to_string()))
+                            }
+                        }
+                        _ => Err(ParseError::InvalidSyntax("Invalid definition structure with return type.".to_string())),
+                    }
+                },
+                _ => Err(ParseError::InvalidSyntax("Definition must have 3 or 4 elements.".to_string())),
             }
         }
         _ => Err(ParseError::InvalidSyntax("Definition must be a list.".to_string())),
@@ -300,13 +328,14 @@ fn arg_name(a : &Arg) -> String {
 
 fn compile_defn(d: &Defn<()>, context: &Context) -> Result<Vec<Instr>, CompileError> {
     match d {
-        Defn::Defn2(name, arg1, arg2, body) =>  {
+        Defn::Defn2(name, arg1, arg2, _return_type, body) =>  {
             let body_env : ImMap<String, i32> = immap!{arg_name(arg1) => 8, arg_name(arg2) => 16};
             let new_context = Context {
                 define_env: context.define_env,
                 env: &body_env,
                 stack_depth: 24,
                 label_counter: context.label_counter,
+                break_label: None,
             };
             let body_instrs = compile_expr_with_env(body, &new_context)?;
             let mut result = vec![ Instr::Label(name.clone()), ];
@@ -347,8 +376,30 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
         Ok(instrs)	
     	
 	}
-	Expr::Loop(_, body) => panic!("Code generation for loop expressions not implemented yet"),
-	Expr::Break(_, value) => panic!("Code generation for break expressions not implemented yet"),
+	Expr::Loop(_, body) => {
+      let loop_label = generate_unique_label("loop_start", context.label_counter);
+      let break_label = generate_unique_label("loop_end", context.label_counter);
+      let mut instrs = vec![Instr::Label(loop_label.clone())];
+      // Create new context with break label for this loop
+      let loop_context = Context {
+          break_label: Some(&break_label),
+          ..*context
+      };
+      instrs.extend(compile_expr_with_env(body, &loop_context)?);
+      instrs.push(Instr::Jmp(loop_label));
+      instrs.push(Instr::Label(break_label));
+      Ok(instrs)
+    },
+	Expr::Break(_, value) => {
+      match &context.break_label {
+          Some(label) => {
+              let mut instrs = compile_expr_with_env(value, context)?;
+              instrs.push(Instr::Jmp(label.to_string()));
+              Ok(instrs)
+          },
+          None => Err(CompileError::UnboundVariable("break outside of loop".to_string()))
+      }
+    },
 	Expr::Id(_, name) => {
       match context.env.get(name) {
         Some(offset) => Ok(vec![Instr::MovFromStack(Reg::Rax, *offset)]),
@@ -430,6 +481,7 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
           env: &new_env,
           stack_depth: context.stack_depth + 8,
           label_counter: context.label_counter,
+          break_label: context.break_label,
       };
       
       instrs.extend(compile_expr_with_env(body_expr, &new_context)?); // Compile body with extended env
@@ -487,6 +539,7 @@ fn compile_program(prog: &Prog<()>) -> Result<(Vec<Instr>, Vec<Instr>), CompileE
               env: &ImMap::new(),
               stack_depth: 16,
               label_counter: &label_counter,
+              break_label: None,
           };
 
           for defn in defns {
@@ -551,6 +604,26 @@ fn t_of<T>(expr: &Expr<T>) -> &T {
     }
 }
 
+fn with_t<T: Clone>(expr: &Expr<T>, t : T) -> Expr<T> {
+    match expr {
+        Expr::Num(_, n) => Expr::Num(t, *n),
+        Expr::True(_) => Expr::True(t),
+        Expr::False(_) => Expr::False(t),
+        Expr::Add1(_, e) => Expr::Add1(t, Box::new(e.as_ref().clone())),
+        Expr::Sub1(_, e) => Expr::Sub1(t, Box::new(e.as_ref().clone())),
+        Expr::Add(_, e1, e2) => Expr::Add(t, Box::new(e1.as_ref().clone()), Box::new(e2.as_ref().clone())),
+        Expr::Less(_, e1, e2) => Expr::Less(t, Box::new(e1.as_ref().clone()), Box::new(e2.as_ref().clone())),
+        Expr::Id(_, name) => Expr::Id(t, name.clone()),
+        Expr::Let(_, name, e1, e2) => Expr::Let(t, name.clone(), Box::new(e1.as_ref().clone()), Box::new(e2.as_ref().clone())),
+        Expr::Call2(_, name, e1, e2) => Expr::Call2(t, name.clone(), Box::new(e1.as_ref().clone()), Box::new(e2.as_ref().clone())),
+        Expr::If(_, e1, e2, e3) => Expr::If(t, Box::new(e1.as_ref().clone()), Box::new(e2.as_ref().clone()), Box::new(e3.as_ref().clone())),
+        Expr::Loop(_, e) => Expr::Loop(t, Box::new(e.as_ref().clone())),
+        Expr::Break(_, e) => Expr::Break(t, Box::new(e.as_ref().clone())),
+        Expr::Set(_, name, e) => Expr::Set(t, name.clone(), Box::new(e.as_ref().clone())),
+    }
+}
+
+
 fn ty_union(t1: &Type, t2: &Type) -> Type {
     match (*t1, *t2) {
         (Type::Num, Type::Num) => Type::Num,
@@ -576,26 +649,119 @@ fn check_typ(t1 : &Type, t2 : &Type) -> Result<(), CompileError> {
     else { Ok(()) }
 }
 
-struct TypeEnv {
-    env: ImMap<String, Type>,
+#[derive(Debug, Clone)]
+struct TypeEnv<'a> {
+    env: &'a ImMap<String, Type>,
+    functions: &'a ImMap<String, Defn<Type>>,
 }
 
-fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> (Expr<Type>, Type) {
+fn parse_type_string(type_str: &str) -> Type {
+    match type_str {
+        "Num" => Type::Num,
+        "Bool" => Type::Bool,
+        _ => Type::Unknown,
+    }
+}
+
+fn extract_arg_type(arg: &Arg) -> Type {
+    match arg {
+        Arg::Name(_) => Type::Unknown,
+        Arg::Annot(_, type_str) => parse_type_string(type_str),
+    }
+}
+
+fn get_function_signature<T>(defn: &Defn<T>) -> (Type, Type, Type) {
+    match defn {
+        Defn::Defn2(_, arg1, arg2, return_type, _body) => {
+            let arg1_type = extract_arg_type(arg1);
+            let arg2_type = extract_arg_type(arg2);
+            let return_type = match return_type {
+                Some(type_str) => parse_type_string(type_str),
+                None => Type::Unknown,
+            };
+            (arg1_type, arg2_type, return_type)
+        }
+    }
+}
+
+
+
+fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> Result<(Expr<Type>, Type), CompileError> {
     match e {
-        Expr::Num(_, _) => todo!(),
-        Expr::True(_) => todo!(),
-        Expr::False(_) => todo!(),
-        Expr::Add1(_, expr) => todo!(),
-        Expr::Sub1(_, expr) => todo!(),
-        Expr::Add(_, expr, expr1) => todo!(),
-        Expr::Less(_, expr, expr1) => todo!(),
-        Expr::Id(_, _) => todo!(),
-        Expr::Let(_, _, expr, expr1) => todo!(),
-        Expr::Call2(_, _, expr, expr1) => todo!(),
-        Expr::If(_, expr, expr1, expr2) => todo!(),
-        Expr::Loop(_, expr) => todo!(),
-        Expr::Break(_, expr) => todo!(),
-        Expr::Set(_, _, expr) => todo!(),
+        Expr::Num(_, n) => Ok((Expr::Num(Type::Num, *n), Type::Nothing)),
+        Expr::True(_) => Ok((Expr::True(Type::Bool), Type::Nothing)),
+        Expr::False(_) => Ok((Expr::False(Type::Bool), Type::Nothing)),
+        Expr::Add1(_, expr) => {
+            let (typed_expr, breaks) = calc_type(expr.as_ref(), type_env)?;
+            Ok((Expr::Add1(Type::Num, Box::new(typed_expr)), breaks))
+        }
+        Expr::Sub1(_, expr) => {
+            let (typed_expr, breaks) = calc_type(expr.as_ref(), type_env)?;
+            Ok((Expr::Sub1(Type::Num, Box::new(typed_expr)), breaks))
+        }
+        Expr::Add(_, expr, expr1) => {
+            let (typed_expr, breaks) = calc_type(expr.as_ref(), type_env)?;
+            let (typed_expr1, breaks1) = calc_type(expr1.as_ref(), type_env)?;
+            Ok((Expr::Add(Type::Num, Box::new(typed_expr), Box::new(typed_expr1)), ty_union(&breaks, &breaks1)))
+        }
+        Expr::Less(_, expr, expr1) => {
+            let (typed_expr, breaks) = calc_type(expr.as_ref(), type_env)?;
+            let (typed_expr1, breaks1) = calc_type(expr1.as_ref(), type_env)?;
+            Ok((Expr::Less(Type::Bool, Box::new(typed_expr), Box::new(typed_expr1)), ty_union(&breaks, &breaks1)))
+        }
+        Expr::Id(_, name) => {
+            let t = type_env.env.get(name).unwrap_or(&Type::Unknown);
+            Ok((Expr::Id(t.clone(), name.clone()), Type::Nothing))
+        }
+        Expr::Let(_, x, expr, expr1) => {
+            let (typed_expr, breaks) = calc_type(expr, type_env)?;
+            let new_env = TypeEnv { env: &type_env.env.update(x.to_string(), *t_of(&typed_expr)), ..*type_env };
+            let (typed_expr1, breaks1) = calc_type(expr1, &new_env)?;
+            Ok((Expr::Let(*t_of(&typed_expr1), x.to_string(), Box::new(typed_expr), Box::new(typed_expr1)), ty_union(&breaks, &breaks1)))
+        }
+        Expr::Call2(_, fun_name, arg1, arg2) => {
+            let (typed_arg1, breaks1) = calc_type(arg1, type_env)?;
+            let (typed_arg2, breaks2) = calc_type(arg2, type_env)?;
+            match type_env.functions.get(fun_name) {
+                Some(defn) => {
+                    let (expected_arg1_type, expected_arg2_type, return_type) = get_function_signature(defn);
+                    check_typ(t_of(&typed_arg1), &expected_arg1_type)?;
+                    check_typ(t_of(&typed_arg2), &expected_arg2_type)?;
+                    Ok((Expr::Call2(return_type.clone(), fun_name.clone(), Box::new(typed_arg1), Box::new(typed_arg2)), ty_union(&breaks1, &breaks2)))
+                }
+                None => {
+                    Err(CompileError::UnboundVariable(fun_name.clone()))
+                }
+            }
+        }
+        Expr::If(_, c, thn, els) => {
+            let (t_c, breaks) = calc_type(c, type_env)?;
+            check_typ(t_of(&t_c), &Type::Bool)?;
+            let (t_thn, breaks1) = calc_type(thn, type_env)?;
+            let (t_els, breaks2) = calc_type(els, type_env)?;
+            let body_type = ty_union(t_of(&t_thn), t_of(&t_els));
+            let all_breaks = ty_union(&ty_union(&breaks, &breaks1), &breaks2);
+            Ok((Expr::If(body_type, Box::new(t_c), Box::new(t_thn), Box::new(t_els)), all_breaks))
+        }
+        Expr::Loop(_, expr) => {
+            let (typed_expr, breaks) = calc_type(expr, type_env)?;
+            Ok((Expr::Loop(breaks, Box::new(typed_expr)), Type::Nothing))
+        }
+        Expr::Break(_, expr) => {
+            let (typed_expr, breaks) = calc_type(expr, type_env)?;
+            let all_breaks = ty_union(&breaks, t_of(&typed_expr));
+            Ok((Expr::Break(Type::Nothing, Box::new(typed_expr)), all_breaks))
+        }
+        Expr::Set(_, x, expr) => {
+            let (typed_expr, breaks) = calc_type(expr, type_env)?;
+            match type_env.env.get(x) {
+                None => return Err(CompileError::UnboundVariable(x.clone())),
+                Some(var_type) => {
+                    check_typ(t_of(&typed_expr), var_type)?;
+                    Ok((Expr::Set(Type::Nothing, x.clone(), Box::new(typed_expr)), breaks))
+                }
+            }
+        }
     }
 }
 
@@ -713,6 +879,7 @@ fn jit_compile_and_run_program(program: &Prog<()>, ops : &mut dynasmrt::x64::Ass
                 env: &ImMap::new(),
                 stack_depth: 16,
                 label_counter: &label_counter,
+                break_label: None,
             };
             for defn in defs {
                 jit_load_function(defn, &context, ops, &mut labels)?;
@@ -817,6 +984,7 @@ fn interactive_mode() -> std::io::Result<()> {
                     env: &ImMap::new(),
                     stack_depth: 16,
                     label_counter: &label_counter,
+                    break_label: None,
                 };
                 
                 match repl_entry {
