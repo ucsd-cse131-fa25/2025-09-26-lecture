@@ -56,6 +56,7 @@ enum Instr {
   Sub(Reg, i32),         // sub register, immediate
   Jmp(String),           // Unconditional jump to label
   Jnz(String),           // Jump to label if not zero
+  Jz(String),            // Jump to label if zero
   JmpReg(Reg),           // Unconditional jump to instrution pointer at address of register
   AddReg(Reg, Reg),      // add register, register
   MovToStack(Reg, i32),  // mov [rsp - offset], register
@@ -264,6 +265,7 @@ fn instr_to_string(instr: &Instr) -> String {
     Instr::Label(name) => format!("{name}: "),
     Instr::Jmp(name) => format!("jmp {name}"),
     Instr::Jnz(name) => format!("jnz {name}"),
+    Instr::Jz(name) => format!("jz {name}"),
     Instr::JmpReg(reg) => format!("jmp [{}]", reg_to_string(reg)),
     Instr::And(reg, val) => format!("and {}, {}", reg_to_string(reg), val),
     Instr::AndReg(reg1, reg2) => format!("and {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
@@ -322,7 +324,29 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
 	Expr::Num(_, n) => Ok(vec![Instr::Mov(Reg::Rax, *n * 2)]),
 	Expr::True(_) => Ok(vec![Instr::Mov(Reg::Rax, 3)]),
 	Expr::False(_) =>  Ok(vec![Instr::Mov(Reg::Rax, 1)]),
-	Expr::If(_, condition, then_expr, else_expr) => panic!("Code generation for if expressions not implemented yet"),
+	Expr::If(_, condition, then_expr, else_expr) => {
+    	let mut instrs = compile_expr_with_env(condition, context)?;
+    
+        let else_label = generate_unique_label("else", context.label_counter);
+        let end_label = generate_unique_label("end_if", context.label_counter);
+        
+        instrs.extend(vec![
+            Instr::Mov(Reg::Rcx, 1),
+            Instr::Cmp(Reg::Rax, Reg::Rcx),
+            Instr::Jz(else_label.clone()),   // Jump to else if condition == false
+        ]);
+        
+        instrs.extend(compile_expr_with_env(then_expr, context)?);
+        instrs.push(Instr::Jmp(end_label.clone()));
+        
+        instrs.push(Instr::Label(else_label));
+        instrs.extend(compile_expr_with_env(else_expr, context)?);
+        
+        instrs.push(Instr::Label(end_label));
+        
+        Ok(instrs)	
+    	
+	}
 	Expr::Loop(_, body) => panic!("Code generation for loop expressions not implemented yet"),
 	Expr::Break(_, value) => panic!("Code generation for break expressions not implemented yet"),
 	Expr::Id(_, name) => {
@@ -635,6 +659,10 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels
       Instr::Jnz(str) => {
           let label = get_or_create_label(ops, labels, str);
           dynasm!(ops ; .arch x64 ; jnz =>label)
+      }
+      Instr::Jz(str) => {
+          let label = get_or_create_label(ops, labels, str);
+          dynasm!(ops ; .arch x64 ; jz =>label)
       }
       Instr::JmpReg(reg) => {
           let reg_num = reg_to_num(reg);
