@@ -1042,8 +1042,22 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels
   }
 }
 
+fn dynasm_extern(ops : &mut dynasmrt::x64::Assembler, func: * const ()) -> DynamicLabel {
+    let label = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64 ; =>label ;
+        mov rax, QWORD func as i64;
+        jmp rax
+    );
+    return label;
+}
+
 fn jit_compile_and_run_program(program: &Prog<Type>, ops : &mut dynasmrt::x64::Assembler) -> Result<i64, CompileError> {
     let mut labels = HashMap::new();
+
+    labels.insert("snek_err".to_string(), dynasm_extern(ops, runtime::snek_err as *const ()));
+    labels.insert("snek_print".to_string(), dynasm_extern(ops, runtime::snek_print as *const ()));
+
+    // TODO(add labels for err, etc)
     match program {
         Prog::Prog(defs, main) => {
             let label_counter = RefCell::new(0);
