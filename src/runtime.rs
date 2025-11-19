@@ -22,6 +22,7 @@ pub fn snek_err(code : i64, val1 : i64, val2 : i64) -> i64 {
     let err = match code {
         1 => "invalid argument",
         2 => "overflow",
+        3 => "cast error",
         _ => "unknown error",
     };
     eprintln!("error {}: {} {}", err, val1, val2);

@@ -69,6 +69,8 @@ enum Instr {
   Test(Reg, i32),        // test register, immediate
   Cmovnz(Reg, i32),      // conditional move if not zero
   CmovnzReg(Reg, Reg),   // conditional move if not zero (register to register)
+  Cmovz(Reg, i32),       // conditional move if zero
+  CmovzReg(Reg, Reg),    // conditional move if zero (register to register)
   Cmp(Reg, Reg),         // compare two registers
   Cmovl(Reg, i32),       // conditional move if less than
 }
@@ -104,7 +106,8 @@ enum Expr<T> {
   If(T, Box<Expr<T>>, Box<Expr<T>>, Box<Expr<T>>),
   Loop(T, Box<Expr<T>>),
   Break(T, Box<Expr<T>>),
-  Set(T, String, Box<Expr<T>>)
+  Set(T, String, Box<Expr<T>>),
+  Cast(T, String, Box<Expr<T>>)
 }
 
 #[derive(Debug)]
@@ -153,6 +156,8 @@ fn parse_expr(s : &Sexp) -> Result<Expr<()>, ParseError> {
           },
         [Sexp::Atom(S(op)), Sexp::Atom(S(var)), val] if op == "set!" =>
           Ok(Expr::Set((), var.to_string(), Box::new(parse_expr(val)?))),
+        [Sexp::Atom(S(op)), Sexp::Atom(S(typ)), e] if op == "cast" =>
+          Ok(Expr::Cast((), typ.to_string(), Box::new(parse_expr(e)?))),
         [Sexp::Atom(S(fun_name)), arg1, arg2] =>
           Ok(Expr::Call2((), fun_name.to_string(), Box::new(parse_expr(arg1)?), Box::new(parse_expr(arg2)?))),
   	_ => Err(ParseError::InvalidSyntax(format!("Unknown expression: {:?}", vec)))
@@ -300,6 +305,8 @@ fn instr_to_string(instr: &Instr) -> String {
     Instr::Test(reg, val) => format!("test {}, {}", reg_to_string(reg), val),
     Instr::Cmovnz(reg, val) => format!("mov rcx, {}\ncmovnz {}, rcx", val, reg_to_string(reg)),
     Instr::CmovnzReg(reg1, reg2) => format!("cmovnz {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
+    Instr::Cmovz(reg, val) => format!("mov rcx, {}\ncmovz {}, rcx", val, reg_to_string(reg)),
+    Instr::CmovzReg(reg1, reg2) => format!("cmovz {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
     Instr::Cmp(reg1, reg2) => format!("cmp {}, {}", reg_to_string(reg1), reg_to_string(reg2)),
     Instr::Cmovl(reg, val) => format!("mov rcx, {}\ncmovl {}, rcx", val, reg_to_string(reg)),
   }
@@ -326,7 +333,7 @@ fn arg_name(a : &Arg) -> String {
     }
 }
 
-fn compile_defn(d: &Defn<()>, context: &Context) -> Result<Vec<Instr>, CompileError> {
+fn compile_defn(d: &Defn<Type>, context: &Context) -> Result<Vec<Instr>, CompileError> {
     match d {
         Defn::Defn2(name, arg1, arg2, _return_type, body) =>  {
             let body_env : ImMap<String, i32> = immap!{arg_name(arg1) => 8, arg_name(arg2) => 16};
@@ -348,7 +355,7 @@ fn compile_defn(d: &Defn<()>, context: &Context) -> Result<Vec<Instr>, CompileEr
     }
 }
 
-fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, CompileError> {
+fn compile_expr_with_env(e: &Expr<Type>, context: &Context) -> Result<Vec<Instr>, CompileError> {
   match e {
 	Expr::Num(_, n) => Ok(vec![Instr::Mov(Reg::Rax, *n * 2)]),
 	Expr::True(_) => Ok(vec![Instr::Mov(Reg::Rax, 3)]),
@@ -430,17 +437,19 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
       instrs.push(Instr::MovToStack(Reg::Rax, context.stack_depth));
       let new_context = Context { stack_depth: context.stack_depth + 8, ..*context };
       instrs.extend(compile_expr_with_env(e2, &new_context)?);
-      // Tag checks
-      instrs.extend(vec![
-        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
-        Instr::AndReg(Reg::Rcx, Reg::Rax),
-        Instr::Test(Reg::Rcx, 1),
-        Instr::Cmovnz(Reg::Rdi, 1),
-        Instr::CmovnzReg(Reg::Rsi, Reg::Rax),
-        Instr::MovFromStack(Reg::Rcx, context.stack_depth),
-        Instr::CmovnzReg(Reg::Rdx, Reg::Rcx),
-        Instr::Jnz("snek_err".to_string()),
-      ]);
+      if !is_subtype(&t_of(e1), &Type::Num) || !is_subtype(&t_of(e2), &Type::Num) {
+          // Tag checks
+          instrs.extend(vec![
+            Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+            Instr::AndReg(Reg::Rcx, Reg::Rax),
+            Instr::Test(Reg::Rcx, 1),
+            Instr::Cmovnz(Reg::Rdi, 1),
+            Instr::CmovnzReg(Reg::Rsi, Reg::Rax),
+            Instr::MovFromStack(Reg::Rcx, context.stack_depth),
+            Instr::CmovnzReg(Reg::Rdx, Reg::Rcx),
+            Instr::Jnz("snek_err".to_string()),
+          ]);
+      };
       // Do the add
       instrs.push(Instr::AddReg(Reg::Rax, Reg::Rcx));
       Ok(instrs)
@@ -525,11 +534,48 @@ fn compile_expr_with_env(e: &Expr<()>, context: &Context) -> Result<Vec<Instr>, 
           Err(CompileError::UnboundVariable(var.clone()))
         }
       }
+    },
+    Expr::Cast(target_type, typ, expr) => {
+      // Compile the expression
+      let mut instrs = compile_expr_with_env(expr, context)?;
+      
+      // Generate dynamic tag check based on target type
+      match parse_type_string(typ) {
+        Type::Num => {
+          // Check if value is a number (LSB = 0, i.e., even)
+          // test rax, 1 sets ZF if LSB is 0
+          instrs.extend(vec![
+            Instr::Test(Reg::Rax, 1),
+            Instr::Cmovnz(Reg::Rdi, 3),        // error code 3 for cast failure
+            Instr::CmovnzReg(Reg::Rsi, Reg::Rax), // actual value
+            Instr::Jnz("snek_err".to_string()),
+          ]);
+        },
+        Type::Bool => {
+          // Check if value is a boolean (LSB = 1, i.e., odd)
+          // We need to check that LSB is 1
+          instrs.extend(vec![
+            Instr::Test(Reg::Rax, 1),
+            Instr::Mov(Reg::Rcx, 3),           // error code 3
+            Instr::Cmovz(Reg::Rdi, 2),         // if ZF set (LSB=0), set error code
+            Instr::CmovzReg(Reg::Rsi, Reg::Rax), // actual value
+            Instr::Jz("snek_err".to_string()),  // jump if not a bool
+          ]);
+        },
+        Type::Unknown => {
+          // No runtime check needed for Unknown type
+        },
+        Type::Nothing => {
+          // Nothing should not appear in casts, but handle gracefully
+        }
+      }
+      
+      Ok(instrs)
     }
   }
 }
 
-fn compile_program(prog: &Prog<()>) -> Result<(Vec<Instr>, Vec<Instr>), CompileError> {
+fn compile_program(prog: &Prog<Type>) -> Result<(Vec<Instr>, Vec<Instr>), CompileError> {
   match prog {
       Prog::Prog(defns, expr) => {
           let mut instrs: Vec<Instr> = Vec::new();
@@ -560,7 +606,7 @@ fn compile_mode(in_name: &str, out_name: &str) -> std::io::Result<()> {
   let prog_wrapped = format!("({})", in_contents);
   let s_expr = parse(&prog_wrapped).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
   let prog = parse_program(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Program parse error: {:?}", e)))?;
-  let (defs, main) = compile_program(&prog).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
+  let (defs, main) = compile_program(&anytyped_prog(&prog)).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   let asm_program = format!("
 section .text
 extern snek_err
@@ -601,6 +647,7 @@ fn t_of<T>(expr: &Expr<T>) -> &T {
         Expr::Loop(t, _) => t,
         Expr::Break(t, _) => t,
         Expr::Set(t, _, _) => t,
+        Expr::Cast(t, _, _) => t,
     }
 }
 
@@ -620,6 +667,7 @@ fn with_t<T: Clone>(expr: &Expr<T>, t : T) -> Expr<T> {
         Expr::Loop(_, e) => Expr::Loop(t, Box::new(e.as_ref().clone())),
         Expr::Break(_, e) => Expr::Break(t, Box::new(e.as_ref().clone())),
         Expr::Set(_, name, e) => Expr::Set(t, name.clone(), Box::new(e.as_ref().clone())),
+        Expr::Cast(_, typ, e) => Expr::Cast(t, typ.clone(), Box::new(e.as_ref().clone())),
     }
 }
 
@@ -684,7 +732,115 @@ fn get_function_signature<T>(defn: &Defn<T>) -> (Type, Type, Type) {
     }
 }
 
+fn anytyped_expr(e: &Expr<()>) -> Expr<Type> {
+    match e {
+        Expr::Num(_, n) => Expr::Num(Type::Unknown, *n),
+        Expr::True(_) => Expr::True(Type::Unknown),
+        Expr::False(_) => Expr::False(Type::Unknown),
+        Expr::Add1(_, expr) => Expr::Add1(Type::Unknown, Box::new(anytyped_expr(expr))),
+        Expr::Sub1(_, expr) => Expr::Sub1(Type::Unknown, Box::new(anytyped_expr(expr))),
+        Expr::Add(_, e1, e2) => Expr::Add(Type::Unknown, Box::new(anytyped_expr(e1)), Box::new(anytyped_expr(e2))),
+        Expr::Less(_, e1, e2) => Expr::Less(Type::Unknown, Box::new(anytyped_expr(e1)), Box::new(anytyped_expr(e2))),
+        Expr::Id(_, name) => Expr::Id(Type::Unknown, name.clone()),
+        Expr::Let(_, x, e1, e2) => Expr::Let(Type::Unknown, x.clone(), Box::new(anytyped_expr(e1)), Box::new(anytyped_expr(e2))),
+        Expr::Call2(_, name, e1, e2) => Expr::Call2(Type::Unknown, name.clone(), Box::new(anytyped_expr(e1)), Box::new(anytyped_expr(e2))),
+        Expr::If(_, e1, e2, e3) => Expr::If(Type::Unknown, Box::new(anytyped_expr(e1)), Box::new(anytyped_expr(e2)), Box::new(anytyped_expr(e3))),
+        Expr::Loop(_, e) => Expr::Loop(Type::Unknown, Box::new(anytyped_expr(e))),
+        Expr::Break(_, e) => Expr::Break(Type::Unknown, Box::new(anytyped_expr(e))),
+        Expr::Set(_, x, e) => Expr::Set(Type::Unknown, x.clone(), Box::new(anytyped_expr(e))),
+        Expr::Cast(_, typ, e) => Expr::Cast(Type::Unknown, typ.clone(), Box::new(anytyped_expr(e))),
+    }
+}
 
+fn anytyped_defn(d: &Defn<()>) -> Defn<Type> {
+    match d {
+        Defn::Defn2(name, arg1, arg2, return_type, body) => {
+            Defn::Defn2(name.clone(), arg1.clone(), arg2.clone(), return_type.clone(), anytyped_expr(body))
+        }
+    }
+}
+
+fn anytyped_prog(prog: &Prog<()>) -> Prog<Type> {
+    match prog {
+        Prog::Prog(defns, main_expr) => {
+            let typed_defns = defns.iter().map(|d| anytyped_defn(d)).collect();
+            Prog::Prog(typed_defns, anytyped_expr(main_expr))
+        }
+    }
+}
+
+fn check_program(prog: &Prog<()>) -> Result<Prog<Type>, CompileError> {
+    match prog {
+        Prog::Prog(defns, main_expr) => {
+            // First pass: build function signature dictionary assuming annotations are correct
+            let mut function_sigs: ImMap<String, Defn<Type>> = ImMap::new();
+            for defn in defns {
+                match defn {
+                    Defn::Defn2(name, arg1, arg2, return_type, _body) => {
+                        // Create a typed definition with empty body (just for signature)
+                        let typed_defn = Defn::Defn2(
+                            name.clone(),
+                            arg1.clone(),
+                            arg2.clone(),
+                            return_type.clone(),
+                            Expr::Num(Type::Unknown, 0) // Placeholder
+                        );
+                        function_sigs = function_sigs.update(name.clone(), typed_defn);
+                    }
+                }
+            }
+            
+            // Second pass: type-check each function body
+            let mut typed_defns = Vec::new();
+            for defn in defns {
+                match defn {
+                    Defn::Defn2(name, arg1, arg2, return_type, body) => {
+                        // Build type environment for this function's body
+                        let arg1_type = extract_arg_type(arg1);
+                        let arg2_type = extract_arg_type(arg2);
+                        let mut fn_env = ImMap::new();
+                        fn_env = fn_env.update(arg_name(arg1), arg1_type);
+                        fn_env = fn_env.update(arg_name(arg2), arg2_type);
+                        
+                        let type_env = TypeEnv {
+                            env: &fn_env,
+                            functions: &function_sigs,
+                        };
+                        
+                        // Type-check the function body
+                        let (typed_body, _break_type) = calc_type(body, &type_env)?;
+                        
+                        // Check return type if specified
+                        if let Some(ret_type_str) = return_type {
+                            let expected_return_type = parse_type_string(ret_type_str);
+                            check_typ(t_of(&typed_body), &expected_return_type)?;
+                        }
+                        
+                        // Create the typed definition
+                        typed_defns.push(Defn::Defn2(
+                            name.clone(),
+                            arg1.clone(),
+                            arg2.clone(),
+                            return_type.clone(),
+                            typed_body
+                        ));
+                    }
+                }
+            }
+            
+            // Type-check the main expression
+            let empty_env = ImMap::new();
+            let type_env = TypeEnv {
+                env: &empty_env,
+                functions: &function_sigs,
+            };
+            
+            let (typed_main, _) = calc_type(main_expr, &type_env)?;
+            
+            Ok(Prog::Prog(typed_defns, typed_main))
+        }
+    }
+}
 
 fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> Result<(Expr<Type>, Type), CompileError> {
     match e {
@@ -761,6 +917,14 @@ fn calc_type(e : &Expr<()>, type_env: &TypeEnv) -> Result<(Expr<Type>, Type), Co
                     Ok((Expr::Set(Type::Nothing, x.clone(), Box::new(typed_expr)), breaks))
                 }
             }
+        }
+        Expr::Cast(_, typ, expr) => {
+            // Type-check the expression
+            let (typed_expr, breaks) = calc_type(expr, type_env)?;
+            // Parse the target type
+            let target_type = parse_type_string(typ);
+            // Cast always type-checks to the target type T
+            Ok((Expr::Cast(target_type, typ.clone(), Box::new(typed_expr)), breaks))
         }
     }
 }
@@ -856,6 +1020,15 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels
         let reg2_num = reg_to_num(reg2);
         dynasm!(ops ; .arch x64 ; cmovnz Rq(reg1_num), Rq(reg2_num));
       }
+      Instr::Cmovz(reg, val) => {
+        let reg_num = reg_to_num(reg);
+        dynasm!(ops ; .arch x64 ; mov rcx, *val ; cmovz Rq(reg_num), rcx);
+      }
+      Instr::CmovzReg(reg1, reg2) => {
+        let reg1_num = reg_to_num(reg1);
+        let reg2_num = reg_to_num(reg2);
+        dynasm!(ops ; .arch x64 ; cmovz Rq(reg1_num), Rq(reg2_num));
+      }
       Instr::Cmp(reg1, reg2) => {
         let reg1_num = reg_to_num(reg1);
         let reg2_num = reg_to_num(reg2);
@@ -869,7 +1042,7 @@ fn instrs_to_asm(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, labels
   }
 }
 
-fn jit_compile_and_run_program(program: &Prog<()>, ops : &mut dynasmrt::x64::Assembler) -> Result<i64, CompileError> {
+fn jit_compile_and_run_program(program: &Prog<Type>, ops : &mut dynasmrt::x64::Assembler) -> Result<i64, CompileError> {
     let mut labels = HashMap::new();
     match program {
         Prog::Prog(defs, main) => {
@@ -890,7 +1063,7 @@ fn jit_compile_and_run_program(program: &Prog<()>, ops : &mut dynasmrt::x64::Ass
     
 }
 
-fn jit_load_function(defn: &Defn<()>, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<dynasmrt::AssemblyOffset, CompileError> {
+fn jit_load_function(defn: &Defn<Type>, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<dynasmrt::AssemblyOffset, CompileError> {
     let instrs = compile_defn(defn, context)?;
     println!("Compiled function\n{}", instrs_to_string(&instrs));
     let start = ops.offset();
@@ -922,7 +1095,7 @@ fn jit_run_instrs(instrs: &Vec<Instr>, ops: &mut dynasmrt::x64::Assembler, label
     
 }
 
-fn jit_compile_and_run_with_defines(expr: &Expr<()>, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
+fn jit_compile_and_run_with_defines(expr: &Expr<Type>, context: &Context, ops: &mut dynasmrt::x64::Assembler, labels: &mut HashMap<String, DynamicLabel>) -> Result<i64, CompileError> {
   // Compile expression to instructions using existing compiler
   let instrs = compile_expr_with_env(expr, context)?;
   println!("Compiled\n{}", instrs_to_string(&instrs));
@@ -930,7 +1103,7 @@ fn jit_compile_and_run_with_defines(expr: &Expr<()>, context: &Context, ops: &mu
 
 }
 
-fn eval_mode(in_name: &str) -> std::io::Result<()> {
+fn eval_mode(in_name: &str, type_check: bool) -> std::io::Result<()> {
   let mut in_file = File::open(in_name)?;
   let mut in_contents = String::new();
   in_file.read_to_string(&mut in_contents)?;
@@ -939,7 +1112,16 @@ fn eval_mode(in_name: &str) -> std::io::Result<()> {
   let prog_wrapped = format!("({})", in_contents);
   let s_expr = parse(&prog_wrapped).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("S-expression parse error: {:?}", e)))?;
   let prog = parse_program(&s_expr).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Expression parse error: {:?}", e)))?;
-  let result = jit_compile_and_run_program(&prog, &mut ops).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
+  
+  // Perform type-checking if requested
+  let typed_prog = if type_check {
+    check_program(&prog).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Type error: {:?}", e)))?
+  }
+  else {
+    anytyped_prog(&prog)
+  };
+  
+  let result = jit_compile_and_run_program(&typed_prog, &mut ops).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Compile error: {:?}", e)))?;
   println!("{}", result);
   
   Ok(())
@@ -989,7 +1171,7 @@ fn interactive_mode() -> std::io::Result<()> {
                 
                 match repl_entry {
                   ReplEntry::Fun(d) => {
-                      match jit_load_function(&d, &context, &mut ops, &mut labels) {
+                      match jit_load_function(&(anytyped_defn(&d)), &context, &mut ops, &mut labels) {
                           Ok(_) => {
                               println!("Function loaded successfully");
                           }
@@ -1000,7 +1182,7 @@ fn interactive_mode() -> std::io::Result<()> {
                   }
                   ReplEntry::Define(var_name, expr) => {
                     // Evaluate the expression and store its value
-                    match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
+                    match jit_compile_and_run_with_defines(&anytyped_expr(&expr), &context, &mut ops, &mut labels) {
                       Ok(value) => {
                         define_env.insert(var_name.clone(), value);
                       }
@@ -1010,7 +1192,7 @@ fn interactive_mode() -> std::io::Result<()> {
                     }
                   }
                   ReplEntry::Expression(expr) => {
-                    match jit_compile_and_run_with_defines(&expr, &context, &mut ops, &mut labels) {
+                    match jit_compile_and_run_with_defines(&anytyped_expr(&expr), &context, &mut ops, &mut labels) {
                       Ok(result) => {
                         println!("Result: {}", result);
                       }
@@ -1048,6 +1230,7 @@ fn main() -> std::io::Result<()> {
     eprintln!("Usage:");
     eprintln!("  {} -c <input.snek> <output.s>   # Compile to assembly", args[0]);
     eprintln!("  {} -e <input.snek>              # Evaluate immediately", args[0]);
+    eprintln!("  {} -te <input.snek>             # Type-check then evaluate", args[0]);
     eprintln!("  {} -i                           # Interactive mode", args[0]);
     std::process::exit(1);
   }
@@ -1065,7 +1248,14 @@ fn main() -> std::io::Result<()> {
         eprintln!("Error: -e flag requires only input file");
         std::process::exit(1);
       }
-      eval_mode(&args[2])
+      eval_mode(&args[2], false)
+    },
+    "-te" => {
+      if args.len() != 3 {
+        eprintln!("Error: -te flag requires only input file");
+        std::process::exit(1);
+      }
+      eval_mode(&args[2], true)
     },
     "-i" => {
       if args.len() != 2 {
@@ -1075,7 +1265,7 @@ fn main() -> std::io::Result<()> {
       interactive_mode()
     },
     _ => {
-      eprintln!("Error: Unknown flag '{}'. Use -c, -e, or -i", args[1]);
+      eprintln!("Error: Unknown flag '{}'. Use -c, -e, -te, or -i", args[1]);
       std::process::exit(1);
     }
   }
